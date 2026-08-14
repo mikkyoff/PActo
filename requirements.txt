@@ -1,0 +1,8 @@
+# Pocket Option API library
+git+https://gitlab.chipatrade.com/chipadevorg/BinaryOptionsTools-v2.git
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# HTTP/WebSocket dependencies used by the application/library
+websockets>=12.0

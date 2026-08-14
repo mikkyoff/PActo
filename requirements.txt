@@ -1,5 +1,5 @@
 # Pocket Option API library
-git+https://gitlab.chipatrade.com/chipadevorg/BinaryOptionsTools-v2.git
+git+https://gitlab.chipatrade.com/chipadevorg/BinaryOptionsTools-v2.git@master#subdirectory=python
 
 # Environment variables
 python-dotenv>=1.0.0

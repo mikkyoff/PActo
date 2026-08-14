@@ -1,1437 +1,955 @@
 import asyncio
-import logging
 import os
 import signal
+import sys
+import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Optional
 
-from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
-
+from dotenv import load_dotenv
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-@dataclass(frozen=True)
-class Config:
-    # Trading
-    asset: str = os.getenv("ASSET", "AUDUSD_otc")
-    timeframe_seconds: int = int(
-        os.getenv("TIMEFRAME_SECONDS", "15")
-    )
-    trade_amount: float = float(
-        os.getenv("TRADE_AMOUNT", "2500")
-    )
-    expiry_seconds: int = int(
-        os.getenv("EXPIRY_SECONDS", "15")
-    )
+load_dotenv()
 
-    # S/R
-    lookback_window: int = int(
-        os.getenv("LOOKBACK_WINDOW", "50")
-    )
-    pivot_strength: int = int(
-        os.getenv("PIVOT_STRENGTH", "3")
-    )
-    zone_tolerance_avg_range: float = float(
-        os.getenv("ZONE_TOLERANCE_AVG_RANGE", "0.75")
-    )
-    min_zone_touches: int = int(
-        os.getenv("MIN_ZONE_TOUCHES", "2")
-    )
-    max_zone_touches: int = int(
-        os.getenv("MAX_ZONE_TOUCHES", "4")
-    )
+SSID = os.getenv("POCKET_OPTION_SSID", "").strip()
 
-    # Candlestick patterns
-    doji_body_max_pct: float = float(
-        os.getenv("DOJI_BODY_MAX_PCT", "0.10")
-    )
-    doji_wick_min_pct: float = float(
-        os.getenv("DOJI_WICK_MIN_PCT", "0.60")
-    )
-    star_hammer_body_max_pct: float = float(
-        os.getenv("STAR_HAMMER_BODY_MAX_PCT", "0.30")
-    )
-    star_hammer_wick_multiplier: float = float(
-        os.getenv("STAR_HAMMER_WICK_MULTIPLIER", "2.0")
-    )
+ASSET = os.getenv("ASSET", "AUDUSD_otc")
+TIMEFRAME = int(os.getenv("TIMEFRAME", "15"))
 
-    # Filters
-    min_range_avg_multiplier: float = float(
-        os.getenv("MIN_RANGE_AVG_MULTIPLIER", "0.5")
-    )
-    trend_candles: int = int(
-        os.getenv("TREND_CANDLES", "3")
-    )
+TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "2500"))
+EXPIRY_SECONDS = int(os.getenv("EXPIRY_SECONDS", "15"))
 
-    # Safety
-    live_trading: bool = (
-        os.getenv("LIVE_TRADING", "false").lower() == "true"
-    )
+LOOKBACK_WINDOW = int(os.getenv("LOOKBACK_WINDOW", "50"))
 
-    # Testing controls
-    max_trades: int = int(
-        os.getenv("MAX_TRADES", "0")
-    )
-    max_consecutive_trades: int = int(
-        os.getenv("MAX_CONSECUTIVE_TRADES", "0")
-    )
+TREND_CANDLES = 3
 
+ZONE_TOLERANCE_MULTIPLIER = float(
+    os.getenv("ZONE_TOLERANCE_MULTIPLIER", "0.75")
+)
 
-CFG = Config()
+MIN_ZONE_TOUCHES = int(os.getenv("MIN_ZONE_TOUCHES", "2"))
+MAX_ZONE_TOUCHES = int(os.getenv("MAX_ZONE_TOUCHES", "4"))
 
-LOG = logging.getLogger("pocket-option-bot")
+DOJI_BODY_MAX_PCT = float(
+    os.getenv("DOJI_BODY_MAX_PCT", "0.10")
+)
 
-STOP_EVENT = asyncio.Event()
+DOJI_WICK_MIN_PCT = float(
+    os.getenv("DOJI_WICK_MIN_PCT", "0.60")
+)
+
+STAR_HAMMER_BODY_MAX_PCT = float(
+    os.getenv("STAR_HAMMER_BODY_MAX_PCT", "0.30")
+)
+
+STAR_HAMMER_WICK_MULTIPLIER = float(
+    os.getenv("STAR_HAMMER_WICK_MULTIPLIER", "2.0")
+)
+
+MIN_RANGE_FILTER = float(
+    os.getenv("MIN_RANGE_FILTER", "0.50")
+)
+
+ONE_TRADE_PER_ZONE = True
+
+# ============================================================
+# GLOBAL STATE
+# ============================================================
+
+running = True
+client = None
+
+candles = []
+active_zone_locks = set()
+
+last_processed_candle_timestamp = None
 
 
 # ============================================================
-# CANDLE MODEL
+# DATA STRUCTURES
 # ============================================================
 
 @dataclass
 class Candle:
-    time: float
+    timestamp: int
     open: float
     high: float
     low: float
     close: float
 
     @property
-    def range(self) -> float:
-        return max(0.0, self.high - self.low)
+    def range(self):
+        return self.high - self.low
 
+    @property
+    def body(self):
+        return abs(self.close - self.open)
 
-# ============================================================
-# CANDLE PARSER
-# ============================================================
+    @property
+    def upper_wick(self):
+        return self.high - max(self.open, self.close)
 
-def first_number(
-    data: dict,
-    keys: tuple[str, ...]
-) -> Optional[float]:
+    @property
+    def lower_wick(self):
+        return min(self.open, self.close) - self.low
 
-    for key in keys:
-
-        if key not in data:
-            continue
-
-        value = data[key]
-
-        if value is None:
-            continue
-
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            continue
-
-    return None
-
-
-def parse_candle(raw: Any) -> Candle:
-
-    if not isinstance(raw, dict):
-        raise ValueError(
-            f"Unexpected candle type: "
-            f"{type(raw).__name__}: {raw!r}"
-        )
-
-    timestamp = first_number(
-        raw,
-        (
-            "time",
-            "timestamp",
-            "ts",
-            "openTime",
-            "open_timestamp",
-        ),
-    )
-
-    open_price = first_number(
-        raw,
-        ("open", "o"),
-    )
-
-    high_price = first_number(
-        raw,
-        ("high", "h"),
-    )
-
-    low_price = first_number(
-        raw,
-        ("low", "l"),
-    )
-
-    close_price = first_number(
-        raw,
-        ("close", "c"),
-    )
-
-    if None in (
-        timestamp,
-        open_price,
-        high_price,
-        low_price,
-        close_price,
-    ):
-        raise ValueError(
-            f"Could not parse candle: {raw!r}"
-        )
-
-    # Convert milliseconds to seconds if necessary.
-    if timestamp > 10_000_000_000:
-        timestamp /= 1000.0
-
-    return Candle(
-        time=timestamp,
-        open=open_price,
-        high=high_price,
-        low=low_price,
-        close=close_price,
-    )
-
-
-# ============================================================
-# CANDLE PATTERN DETECTION
-# ============================================================
-
-def candle_patterns(candle: Candle) -> set[str]:
-
-    candle_range = candle.range
-
-    if candle_range <= 0:
-        return set()
-
-    body = abs(
-        candle.close - candle.open
-    )
-
-    upper_wick = (
-        candle.high -
-        max(candle.open, candle.close)
-    )
-
-    lower_wick = (
-        min(candle.open, candle.close) -
-        candle.low
-    )
-
-    patterns = set()
-
-    # --------------------------------------------------------
-    # GRAVESTONE DOJI
-    # --------------------------------------------------------
-
-    if (
-        body <= CFG.doji_body_max_pct * candle_range
-        and
-        upper_wick >= CFG.doji_wick_min_pct * candle_range
-        and
-        lower_wick <= CFG.doji_body_max_pct * candle_range
-    ):
-        patterns.add("GRAVESTONE_DOJI")
-
-    # --------------------------------------------------------
-    # SHOOTING STAR
-    # --------------------------------------------------------
-
-    body_in_lower_third = (
-        max(candle.open, candle.close)
-        <= candle.low + candle_range / 3.0
-    )
-
-    if (
-        body <= CFG.star_hammer_body_max_pct * candle_range
-        and
-        upper_wick
-        >= CFG.star_hammer_wick_multiplier * body
-        and
-        body_in_lower_third
-    ):
-        patterns.add("SHOOTING_STAR")
-
-    # --------------------------------------------------------
-    # DRAGONFLY DOJI
-    # --------------------------------------------------------
-
-    if (
-        body <= CFG.doji_body_max_pct * candle_range
-        and
-        lower_wick >= CFG.doji_wick_min_pct * candle_range
-        and
-        upper_wick <= CFG.doji_body_max_pct * candle_range
-    ):
-        patterns.add("DRAGONFLY_DOJI")
-
-    # --------------------------------------------------------
-    # HAMMER
-    # --------------------------------------------------------
-
-    body_in_upper_third = (
-        min(candle.open, candle.close)
-        >= candle.low + 2.0 * candle_range / 3.0
-    )
-
-    if (
-        body <= CFG.star_hammer_body_max_pct * candle_range
-        and
-        lower_wick
-        >= CFG.star_hammer_wick_multiplier * body
-        and
-        body_in_upper_third
-    ):
-        patterns.add("HAMMER")
-
-    return patterns
-
-
-# ============================================================
-# RANGE CALCULATION
-# ============================================================
-
-def average_range(
-    candles: list[Candle]
-) -> float:
-
-    ranges = [
-        candle.range
-        for candle in candles
-        if candle.range > 0
-    ]
-
-    if not ranges:
-        return 0.0
-
-    return sum(ranges) / len(ranges)
-
-
-# ============================================================
-# S/R ZONE
-# ============================================================
 
 @dataclass
 class Zone:
-    kind: str
-
-    low: float
-
-    high: float
-
+    zone_low: float
+    zone_high: float
     touch_count: int
+    zone_type: str
 
-    center: float
-
-    def contains(
-        self,
-        price: float
-    ) -> bool:
-
-        return (
-            self.low
-            <= price
-            <= self.high
-        )
+    @property
+    def center(self):
+        return (self.zone_low + self.zone_high) / 2
 
 
 # ============================================================
-# SUPPORT / RESISTANCE DETECTION
+# LOGGING
 # ============================================================
 
-def detect_zones(
-    candles: list[Candle]
-) -> list[Zone]:
+def log(message: str):
+    now = datetime.now().strftime("%H:%M:%S")
+    print(f"[{now}] {message}", flush=True)
 
-    if len(candles) < (
-        2 * CFG.pivot_strength + 1
-    ):
-        return []
 
-    avg_range = average_range(candles)
+def print_header():
+    print("=" * 80)
+    print("POCKET OPTION 15s REVERSAL BOT")
+    print("=" * 80)
+    print(f"Asset          : {ASSET}")
+    print(f"Timeframe      : {TIMEFRAME}s")
+    print(f"Trade amount   : ${TRADE_AMOUNT:,.2f}")
+    print(f"Expiry         : {EXPIRY_SECONDS}s")
+    print(f"S/R lookback   : {LOOKBACK_WINDOW} candles")
+    print("=" * 80)
 
-    if avg_range <= 0:
-        return []
 
-    tolerance = (
-        CFG.zone_tolerance_avg_range
-        * avg_range
-    )
+# ============================================================
+# SHUTDOWN
+# ============================================================
 
-    pivot_strength = CFG.pivot_strength
+def shutdown_handler(signum, frame):
+    global running
 
-    support_points: list[float] = []
+    log("Shutdown signal received.")
+    running = False
 
-    resistance_points: list[float] = []
 
-    for index in range(
-        pivot_strength,
-        len(candles) - pivot_strength,
-    ):
+signal.signal(signal.SIGINT, shutdown_handler)
+signal.signal(signal.SIGTERM, shutdown_handler)
 
-        current = candles[index]
 
-        surrounding = (
-            candles[
-                index - pivot_strength:
-                index + pivot_strength + 1
-            ]
-        )
+# ============================================================
+# IMPORT POCKET OPTION LIBRARY
+# ============================================================
 
-        neighbors = [
-            candle
-            for candle in surrounding
-            if candle is not current
-        ]
+def import_library():
+    """
+    Import the async Pocket Option client.
 
-        # ----------------------------------------------------
-        # RESISTANCE PIVOT
-        # ----------------------------------------------------
+    The exact import is intentionally kept here so that if the
+    package exposes a slightly different import path in a future
+    library update, only this section needs changing.
+    """
 
-        if all(
-            current.high > candle.high
-            for candle in neighbors
-        ):
-            resistance_points.append(
-                current.high
-            )
+    try:
+        from binary_options_tools.async_client import PocketOptionAsync
 
-        # ----------------------------------------------------
-        # SUPPORT PIVOT
-        # ----------------------------------------------------
+        return PocketOptionAsync
 
-        if all(
-            current.low < candle.low
-            for candle in neighbors
-        ):
-            support_points.append(
-                current.low
-            )
+    except ImportError as exc:
+        print()
+        print("ERROR: Could not import PocketOptionAsync.")
+        print()
+        print("Installed BinaryOptionsTools-v2 may expose the")
+        print("client through a different import path.")
+        print()
+        print(f"Original error: {exc}")
+        print()
+        raise
 
-    def cluster_points(
-        points: list[float],
-        kind: str,
-    ) -> list[Zone]:
 
-        if not points:
-            return []
+# ============================================================
+# NORMALIZE CANDLE
+# ============================================================
 
-        points = sorted(points)
+def normalize_candle(raw: Any) -> Optional[Candle]:
+    """
+    Convert different possible candle structures returned by the
+    library into our internal Candle structure.
+    """
 
-        groups: list[list[float]] = []
+    try:
 
-        for price in points:
+        if isinstance(raw, Candle):
+            return raw
 
-            if not groups:
-                groups.append([price])
-                continue
+        if isinstance(raw, dict):
 
-            current_center = (
-                sum(groups[-1])
-                / len(groups[-1])
-            )
-
-            if (
-                abs(price - current_center)
-                <= tolerance
-            ):
-                groups[-1].append(price)
-
-            else:
-                groups.append([price])
-
-        zones: list[Zone] = []
-
-        for group in groups:
-
-            touch_count = len(group)
-
-            if not (
-                CFG.min_zone_touches
-                <= touch_count
-                <= CFG.max_zone_touches
-            ):
-                continue
-
-            center = (
-                sum(group)
-                / len(group)
-            )
-
-            zones.append(
-                Zone(
-                    kind=kind,
-                    low=center - tolerance,
-                    high=center + tolerance,
-                    touch_count=touch_count,
-                    center=center,
+            timestamp = raw.get(
+                "timestamp",
+                raw.get(
+                    "time",
+                    raw.get(
+                        "from",
+                        raw.get("at")
+                    )
                 )
             )
 
-        return zones
+            open_price = raw.get(
+                "open",
+                raw.get("o")
+            )
 
-    return (
-        cluster_points(
-            support_points,
-            "support",
-        )
-        +
-        cluster_points(
-            resistance_points,
-            "resistance",
-        )
-    )
+            high_price = raw.get(
+                "high",
+                raw.get("h")
+            )
 
+            low_price = raw.get(
+                "low",
+                raw.get("l")
+            )
 
-# ============================================================
-# TREND PRECONDITION
-# ============================================================
+            close_price = raw.get(
+                "close",
+                raw.get("c")
+            )
 
-def trend_gate(
-    prior_candles: list[Candle],
-    direction: str,
-) -> bool:
+            if None in (
+                timestamp,
+                open_price,
+                high_price,
+                low_price,
+                close_price
+            ):
+                return None
 
-    if len(prior_candles) < 3:
-        return False
+            return Candle(
+                timestamp=int(float(timestamp)),
+                open=float(open_price),
+                high=float(high_price),
+                low=float(low_price),
+                close=float(close_price)
+            )
 
-    # Most recent prior candle = C-1
-    c1 = prior_candles[-1]
-
-    # Previous = C-2
-    c2 = prior_candles[-2]
-
-    # Previous = C-3
-    c3 = prior_candles[-3]
-
-    # BUY:
-    #
-    # C-1.low < C-2.low < C-3.low
-    #
-    # Strict inequality is intentional.
-
-    if direction == "BUY":
-
-        return (
-            c1.low
-            < c2.low
-            < c3.low
-        )
-
-    # SELL:
-    #
-    # C-1.high > C-2.high > C-3.high
-    #
-    # Strict inequality is intentional.
-
-    if direction == "SELL":
-
-        return (
-            c1.high
-            > c2.high
-            > c3.high
-        )
-
-    return False
-
-
-# ============================================================
-# SIGNAL DETECTION
-# ============================================================
-
-def find_signal(
-    closed_candles: list[Candle]
-) -> Optional[dict]:
-
-    required = (
-        CFG.lookback_window + 4
-    )
-
-    if len(closed_candles) < required:
         return None
 
-    # --------------------------------------------------------
-    # C0 = most recently closed candle
-    # --------------------------------------------------------
+    except Exception as exc:
 
-    c0 = closed_candles[-1]
+        log(f"Could not normalize candle: {exc}")
+        return None
 
-    # --------------------------------------------------------
-    # Previous candles used for S/R
-    #
-    # IMPORTANT:
-    # C0 is deliberately excluded.
-    # --------------------------------------------------------
 
-    zone_candles = closed_candles[
-        -(CFG.lookback_window + 1):-1
+# ============================================================
+# CANDLE PATTERNS
+# ============================================================
+
+def is_gravestone_doji(candle: Candle) -> bool:
+
+    if candle.range <= 0:
+        return False
+
+    return (
+        candle.body <= DOJI_BODY_MAX_PCT * candle.range
+        and
+        candle.upper_wick >= DOJI_WICK_MIN_PCT * candle.range
+        and
+        candle.lower_wick <= DOJI_BODY_MAX_PCT * candle.range
+    )
+
+
+def is_dragonfly_doji(candle: Candle) -> bool:
+
+    if candle.range <= 0:
+        return False
+
+    return (
+        candle.body <= DOJI_BODY_MAX_PCT * candle.range
+        and
+        candle.lower_wick >= DOJI_WICK_MIN_PCT * candle.range
+        and
+        candle.upper_wick <= DOJI_BODY_MAX_PCT * candle.range
+    )
+
+
+def is_shooting_star(candle: Candle) -> bool:
+
+    if candle.range <= 0:
+        return False
+
+    body = candle.body
+
+    if body <= 0:
+        return False
+
+    body_in_lower_third = (
+        max(candle.open, candle.close)
+        <= candle.low + (candle.range * (1 / 3))
+    )
+
+    return (
+        body <= STAR_HAMMER_BODY_MAX_PCT * candle.range
+        and
+        candle.upper_wick >= STAR_HAMMER_WICK_MULTIPLIER * body
+        and
+        body_in_lower_third
+    )
+
+
+def is_hammer(candle: Candle) -> bool:
+
+    if candle.range <= 0:
+        return False
+
+    body = candle.body
+
+    if body <= 0:
+        return False
+
+    body_in_upper_third = (
+        min(candle.open, candle.close)
+        >= candle.low + (candle.range * (2 / 3))
+    )
+
+    return (
+        body <= STAR_HAMMER_BODY_MAX_PCT * candle.range
+        and
+        candle.lower_wick >= STAR_HAMMER_WICK_MULTIPLIER * body
+        and
+        body_in_upper_third
+    )
+
+
+# ============================================================
+# TREND GATES
+# ============================================================
+
+def buy_trend_gate(history):
+
+    if len(history) < 4:
+        return False
+
+    c0 = history[-1]
+    c1 = history[-2]
+    c2 = history[-3]
+    c3 = history[-4]
+
+    return (
+        c1.low < c2.low
+        and
+        c2.low < c3.low
+    )
+
+
+def sell_trend_gate(history):
+
+    if len(history) < 4:
+        return False
+
+    c0 = history[-1]
+    c1 = history[-2]
+    c2 = history[-3]
+    c3 = history[-4]
+
+    return (
+        c1.high > c2.high
+        and
+        c2.high > c3.high
+    )
+
+
+# ============================================================
+# PIVOT DETECTION
+# ============================================================
+
+def find_pivot_high(data, index, strength=3):
+
+    if index - strength < 0:
+        return False
+
+    if index + strength >= len(data):
+        return False
+
+    value = data[index].high
+
+    for i in range(index - strength, index + strength + 1):
+
+        if i == index:
+            continue
+
+        if data[i].high >= value:
+            return False
+
+    return True
+
+
+def find_pivot_low(data, index, strength=3):
+
+    if index - strength < 0:
+        return False
+
+    if index + strength >= len(data):
+        return False
+
+    value = data[index].low
+
+    for i in range(index - strength, index + strength + 1):
+
+        if i == index:
+            continue
+
+        if data[i].low <= value:
+            return False
+
+    return True
+
+
+# ============================================================
+# ZONE CLUSTERING
+# ============================================================
+
+def average_range(data):
+
+    valid = [c.range for c in data if c.range > 0]
+
+    if not valid:
+        return 0
+
+    return sum(valid) / len(valid)
+
+
+def build_zones(data):
+
+    if len(data) < LOOKBACK_WINDOW:
+        return [], []
+
+    data = data[-LOOKBACK_WINDOW:]
+
+    avg_range = average_range(data)
+
+    if avg_range <= 0:
+        return [], []
+
+    tolerance = avg_range * ZONE_TOLERANCE_MULTIPLIER
+
+    resistance_pivots = []
+    support_pivots = []
+
+    # Strength 3 means 3 candles on either side.
+    for i in range(len(data)):
+
+        if find_pivot_high(data, i, 3):
+            resistance_pivots.append(data[i].high)
+
+        if find_pivot_low(data, i, 3):
+            support_pivots.append(data[i].low)
+
+    resistance_zones = cluster_prices(
+        resistance_pivots,
+        tolerance,
+        "resistance"
+    )
+
+    support_zones = cluster_prices(
+        support_pivots,
+        tolerance,
+        "support"
+    )
+
+    return support_zones, resistance_zones
+
+
+def cluster_prices(prices, tolerance, zone_type):
+
+    if not prices:
+        return []
+
+    prices = sorted(prices)
+
+    clusters = []
+
+    current = [prices[0]]
+
+    for price in prices[1:]:
+
+        if abs(price - sum(current) / len(current)) <= tolerance:
+
+            current.append(price)
+
+        else:
+
+            clusters.append(current)
+            current = [price]
+
+    clusters.append(current)
+
+    zones = []
+
+    for cluster in clusters:
+
+        if len(cluster) < MIN_ZONE_TOUCHES:
+            continue
+
+        if len(cluster) > MAX_ZONE_TOUCHES:
+            continue
+
+        center = sum(cluster) / len(cluster)
+
+        zones.append(
+            Zone(
+                zone_low=center - tolerance,
+                zone_high=center + tolerance,
+                touch_count=len(cluster),
+                zone_type=zone_type
+            )
+        )
+
+    return zones
+
+
+# ============================================================
+# ZONE MATCHING
+# ============================================================
+
+def price_in_zone(price, zone):
+
+    return zone.zone_low <= price <= zone.zone_high
+
+
+def find_support_zone(price, zones):
+
+    candidates = [
+        z for z in zones
+        if price_in_zone(price, z)
     ]
 
+    if not candidates:
+        return None
+
+    return min(
+        candidates,
+        key=lambda z: abs(z.center - price)
+    )
+
+
+def find_resistance_zone(price, zones):
+
+    candidates = [
+        z for z in zones
+        if price_in_zone(price, z)
+    ]
+
+    if not candidates:
+        return None
+
+    return min(
+        candidates,
+        key=lambda z: abs(z.center - price)
+    )
+
+
+# ============================================================
+# SIGNAL EVALUATION
+# ============================================================
+
+def evaluate_signal(data):
+
+    if len(data) < LOOKBACK_WINDOW:
+        return None
+
+    c0 = data[-1]
+
     # --------------------------------------------------------
-    # RANGE FILTER
+    # Minimum range filter
     # --------------------------------------------------------
 
     avg_range = average_range(
-        zone_candles
+        data[-LOOKBACK_WINDOW:]
     )
 
-    if avg_range <= 0:
-        return None
+    if c0.range < MIN_RANGE_FILTER * avg_range:
 
-    if (
-        c0.range
-        < CFG.min_range_avg_multiplier
-        * avg_range
-    ):
-        return None
+        log(
+            "Signal rejected: candle range below "
+            "minimum range filter."
+        )
 
-    # --------------------------------------------------------
-    # PATTERN DETECTION
-    # --------------------------------------------------------
-
-    patterns = candle_patterns(c0)
-
-    if not patterns:
         return None
 
     # --------------------------------------------------------
-    # BUILD S/R
+    # Build zones from CLOSED candles only
     # --------------------------------------------------------
 
-    zones = detect_zones(
-        zone_candles
-    )
+    support_zones, resistance_zones = build_zones(data)
 
     # --------------------------------------------------------
-    # BUY SETUP
+    # BUY
+    # Trend gate MUST happen before pattern/zone evaluation.
     # --------------------------------------------------------
 
-    # HARD TREND GATE FIRST.
+    if buy_trend_gate(data):
 
-    if trend_gate(
-        closed_candles[:-1],
-        "BUY",
-    ):
+        support_zone = find_support_zone(
+            c0.low,
+            support_zones
+        )
 
-        if (
-            "DRAGONFLY_DOJI" in patterns
-            or
-            "HAMMER" in patterns
-        ):
+        if support_zone:
 
-            support_zones = [
-                zone
-                for zone in zones
-                if (
-                    zone.kind == "support"
-                    and zone.contains(c0.low)
-                )
-            ]
+            if (
+                is_dragonfly_doji(c0)
+                or
+                is_hammer(c0)
+            ):
 
-            if support_zones:
-
-                selected_zone = max(
-                    support_zones,
-                    key=lambda zone:
-                    zone.touch_count,
-                )
-
-                matching_patterns = (
-                    patterns
-                    &
-                    {
-                        "DRAGONFLY_DOJI",
-                        "HAMMER",
-                    }
+                pattern = (
+                    "DRAGONFLY_DOJI"
+                    if is_dragonfly_doji(c0)
+                    else "HAMMER"
                 )
 
                 return {
                     "direction": "BUY",
-                    "pattern": sorted(
-                        matching_patterns
-                    )[0],
-                    "zone": selected_zone,
-                    "candle": c0,
+                    "pattern": pattern,
+                    "zone": support_zone,
+                    "candle": c0
                 }
 
     # --------------------------------------------------------
-    # SELL SETUP
+    # SELL
+    # Trend gate MUST happen before pattern/zone evaluation.
     # --------------------------------------------------------
 
-    # HARD TREND GATE FIRST.
+    if sell_trend_gate(data):
 
-    if trend_gate(
-        closed_candles[:-1],
-        "SELL",
-    ):
+        resistance_zone = find_resistance_zone(
+            c0.high,
+            resistance_zones
+        )
 
-        if (
-            "GRAVESTONE_DOJI" in patterns
-            or
-            "SHOOTING_STAR" in patterns
-        ):
+        if resistance_zone:
 
-            resistance_zones = [
-                zone
-                for zone in zones
-                if (
-                    zone.kind == "resistance"
-                    and zone.contains(c0.high)
-                )
-            ]
+            if (
+                is_gravestone_doji(c0)
+                or
+                is_shooting_star(c0)
+            ):
 
-            if resistance_zones:
-
-                selected_zone = max(
-                    resistance_zones,
-                    key=lambda zone:
-                    zone.touch_count,
-                )
-
-                matching_patterns = (
-                    patterns
-                    &
-                    {
-                        "GRAVESTONE_DOJI",
-                        "SHOOTING_STAR",
-                    }
+                pattern = (
+                    "GRAVESTONE_DOJI"
+                    if is_gravestone_doji(c0)
+                    else "SHOOTING_STAR"
                 )
 
                 return {
                     "direction": "SELL",
-                    "pattern": sorted(
-                        matching_patterns
-                    )[0],
-                    "zone": selected_zone,
-                    "candle": c0,
+                    "pattern": pattern,
+                    "zone": resistance_zone,
+                    "candle": c0
                 }
 
     return None
-
-
-# ============================================================
-# TRADE MANAGER
-# ============================================================
-
-class TradeManager:
-
-    def __init__(self):
-
-        self.trade_count = 0
-
-        self.consecutive_signals = 0
-
-        # Each entry:
-        #
-        # (zone_kind, zone_low, zone_high)
-        self.locked_zones = []
-
-    def can_trade(self) -> bool:
-
-        if (
-            CFG.max_trades > 0
-            and
-            self.trade_count
-            >= CFG.max_trades
-        ):
-            return False
-
-        if (
-            CFG.max_consecutive_trades > 0
-            and
-            self.consecutive_signals
-            >= CFG.max_consecutive_trades
-        ):
-            return False
-
-        return True
-
-    def zone_is_locked(
-        self,
-        zone: Zone,
-        current_price: float,
-    ) -> bool:
-
-        new_locked_zones = []
-
-        locked = False
-
-        for (
-            zone_kind,
-            zone_low,
-            zone_high,
-        ) in self.locked_zones:
-
-            # Price is still inside the zone.
-            if (
-                zone_low
-                <= current_price
-                <= zone_high
-            ):
-
-                new_locked_zones.append(
-                    (
-                        zone_kind,
-                        zone_low,
-                        zone_high,
-                    )
-                )
-
-                if (
-                    zone_kind == zone.kind
-                    and
-                    zone_low
-                    <= zone.center
-                    <= zone_high
-                ):
-                    locked = True
-
-        # A zone disappears from the lock once
-        # price has left it.
-
-        self.locked_zones = (
-            new_locked_zones
-        )
-
-        return locked
-
-    def lock_zone(
-        self,
-        zone: Zone,
-    ) -> None:
-
-        self.locked_zones.append(
-            (
-                zone.kind,
-                zone.low,
-                zone.high,
-            )
-        )
 
 
 # ============================================================
 # TRADE EXECUTION
 # ============================================================
 
-async def place_trade(
-    api: PocketOptionAsync,
-    signal_data: dict,
-    manager: TradeManager,
-):
+async def execute_trade(signal_data):
 
-    if not manager.can_trade():
+    direction = signal_data["direction"]
+    pattern = signal_data["pattern"]
+    zone = signal_data["zone"]
 
-        LOG.warning(
-            "Trade limit reached. "
-            "Signal ignored."
-        )
+    log("")
+    log("=" * 60)
+    log("VALID TRADE SIGNAL")
+    log("=" * 60)
+
+    log(f"Direction : {direction}")
+    log(f"Pattern   : {pattern}")
+
+    log(
+        f"Zone      : "
+        f"{zone.zone_low:.6f} - {zone.zone_high:.6f}"
+    )
+
+    log(
+        f"Amount    : ${TRADE_AMOUNT:,.2f}"
+    )
+
+    log(
+        f"Expiry    : {EXPIRY_SECONDS}s"
+    )
+
+    log("=" * 60)
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # The exact order method used by BinaryOptionsTools-v2
+    # depends on the installed version's async API.
+    #
+    # This section intentionally isolates order submission.
+    # --------------------------------------------------------
+
+    try:
+
+        if direction == "BUY":
+
+            result = await client.buy(
+                asset=ASSET,
+                amount=TRADE_AMOUNT,
+                duration=EXPIRY_SECONDS
+            )
+
+        else:
+
+            result = await client.sell(
+                asset=ASSET,
+                amount=TRADE_AMOUNT,
+                duration=EXPIRY_SECONDS
+            )
+
+        log(f"TRADE SUBMITTED: {result}")
+
+        return result
+
+    except Exception as exc:
+
+        log(f"TRADE ERROR: {type(exc).__name__}: {exc}")
 
         return None
 
-    direction = signal_data[
-        "direction"
-    ]
 
-    pattern = signal_data[
-        "pattern"
-    ]
+# ============================================================
+# CANDLE PROCESSOR
+# ============================================================
 
-    zone: Zone = signal_data[
-        "zone"
-    ]
+async def process_closed_candle(candle):
 
-    candle: Candle = signal_data[
-        "candle"
-    ]
-
-    # --------------------------------------------------------
-    # SAFETY CHECK
-    # --------------------------------------------------------
-
-    demo_account = api.is_demo()
+    global last_processed_candle_timestamp
 
     if (
-        not CFG.live_trading
+        last_processed_candle_timestamp
+        == candle.timestamp
+    ):
+        return
+
+    last_processed_candle_timestamp = candle.timestamp
+
+    candles.append(candle)
+
+    if len(candles) > LOOKBACK_WINDOW + 20:
+        del candles[:-LOOKBACK_WINDOW - 20]
+
+    log(
+        f"CANDLE CLOSED | "
+        f"{datetime.fromtimestamp(candle.timestamp).strftime('%H:%M:%S')} | "
+        f"O={candle.open:.6f} "
+        f"H={candle.high:.6f} "
+        f"L={candle.low:.6f} "
+        f"C={candle.close:.6f}"
+    )
+
+    if len(candles) < LOOKBACK_WINDOW:
+        log(
+            f"Building history: "
+            f"{len(candles)}/{LOOKBACK_WINDOW}"
+        )
+
+        return
+
+    signal_data = evaluate_signal(candles)
+
+    if not signal_data:
+        return
+
+    zone = signal_data["zone"]
+
+    zone_key = (
+        zone.zone_type,
+        round(zone.center, 6)
+    )
+
+    if (
+        ONE_TRADE_PER_ZONE
         and
-        not demo_account
+        zone_key in active_zone_locks
     ):
 
-        raise RuntimeError(
-            "SAFETY STOP: "
-            "LIVE_TRADING=false but "
-            "the connected account is LIVE."
+        log(
+            "Signal blocked: zone already traded "
+            "during current touch."
         )
 
-    LOG.warning(
-        "================================================"
-    )
+        return
 
-    LOG.warning(
-        "VALID SIGNAL"
-    )
+    # Lock before execution to prevent duplicate submissions.
+    active_zone_locks.add(zone_key)
 
-    LOG.warning(
-        "Direction : %s",
-        direction,
-    )
-
-    LOG.warning(
-        "Pattern   : %s",
-        pattern,
-    )
-
-    LOG.warning(
-        "C0 Open   : %.6f",
-        candle.open,
-    )
-
-    LOG.warning(
-        "C0 High   : %.6f",
-        candle.high,
-    )
-
-    LOG.warning(
-        "C0 Low    : %.6f",
-        candle.low,
-    )
-
-    LOG.warning(
-        "C0 Close  : %.6f",
-        candle.close,
-    )
-
-    LOG.warning(
-        "Zone      : %s",
-        zone.kind,
-    )
-
-    LOG.warning(
-        "Zone      : %.6f - %.6f",
-        zone.low,
-        zone.high,
-    )
-
-    LOG.warning(
-        "Touches   : %d",
-        zone.touch_count,
-    )
-
-    LOG.warning(
-        "Amount    : $%.2f",
-        CFG.trade_amount,
-    )
-
-    LOG.warning(
-        "Expiry    : %d seconds",
-        CFG.expiry_seconds,
-    )
-
-    LOG.warning(
-        "================================================"
-    )
-
-    # --------------------------------------------------------
-    # EXECUTE
-    # --------------------------------------------------------
-
-    if direction == "BUY":
-
-        trade_id, deal = await api.buy(
-            asset=CFG.asset,
-            amount=CFG.trade_amount,
-            time=CFG.expiry_seconds,
-            check_win=False,
-        )
-
-    else:
-
-        trade_id, deal = await api.sell(
-            asset=CFG.asset,
-            amount=CFG.trade_amount,
-            time=CFG.expiry_seconds,
-            check_win=False,
-        )
-
-    manager.trade_count += 1
-
-    manager.consecutive_signals += 1
-
-    manager.lock_zone(zone)
-
-    LOG.warning(
-        "TRADE SUBMITTED"
-    )
-
-    LOG.warning(
-        "Trade ID: %s",
-        trade_id,
-    )
-
-    LOG.warning(
-        "Deal: %s",
-        deal,
-    )
-
-    # Don't block the market stream while waiting
-    # for the result.
-
-    asyncio.create_task(
-        report_trade_result(
-            api,
-            trade_id,
-        )
-    )
-
-    return trade_id
+    await execute_trade(signal_data)
 
 
 # ============================================================
-# TRADE RESULT
+# STREAM HANDLING
 # ============================================================
 
-async def report_trade_result(
-    api: PocketOptionAsync,
-    trade_id: str,
-):
+async def handle_tick_stream():
 
-    try:
+    """
+    Main live-stream loop.
 
-        result = await api.check_win(
-            trade_id
-        )
+    The exact subscription/stream method names can vary between
+    BinaryOptionsTools-v2 revisions. This function is kept
+    isolated so the rest of the strategy remains unchanged.
+    """
 
-        LOG.warning(
-            "TRADE RESULT | %s | %s",
-            trade_id,
-            result,
-        )
-
-    except Exception:
-
-        LOG.exception(
-            "Unable to retrieve result "
-            "for trade %s",
-            trade_id,
-        )
-
-
-# ============================================================
-# MAIN BOT
-# ============================================================
-
-async def run_bot():
-
-    ssid = os.getenv(
-        "POCKET_OPTION_SSID"
-    )
-
-    if not ssid:
-
-        raise RuntimeError(
-            "POCKET_OPTION_SSID "
-            "environment variable is required."
-        )
-
-    LOG.info(
-        "================================================"
-    )
-
-    LOG.info(
-        "POCKET OPTION 15s S/R REJECTION BOT"
-    )
-
-    LOG.info(
-        "================================================"
-    )
-
-    LOG.info(
-        "Asset          : %s",
-        CFG.asset,
-    )
-
-    LOG.info(
-        "Timeframe      : %ss",
-        CFG.timeframe_seconds,
-    )
-
-    LOG.info(
-        "Trade amount   : $%.2f",
-        CFG.trade_amount,
-    )
-
-    LOG.info(
-        "Expiry         : %ss",
-        CFG.expiry_seconds,
-    )
-
-    LOG.info(
-        "S/R lookback   : %d candles",
-        CFG.lookback_window,
-    )
-
-    LOG.info(
-        "LIVE_TRADING   : %s",
-        CFG.live_trading,
-    )
-
-    LOG.info(
-        "================================================"
-    )
-
-    # --------------------------------------------------------
-    # CREATE CLIENT
-    # --------------------------------------------------------
-
-    api = PocketOptionAsync(
-        ssid,
-        config={
-            "terminal_logging": False,
-            "log_level": "WARNING",
-        },
+    log(
+        f"Subscribing to {ASSET} "
+        f"at {TIMEFRAME}s..."
     )
 
     try:
 
-        # Give the websocket time to initialize.
-
-        await asyncio.sleep(5)
-
         # ----------------------------------------------------
-        # ACCOUNT
+        # Attempt the async subscription API.
         # ----------------------------------------------------
 
-        demo = api.is_demo()
-
-        balance = await api.balance()
-
-        LOG.info(
-            "Account type : %s",
-            "DEMO" if demo else "LIVE",
+        stream = await client.subscribe_candles(
+            asset=ASSET,
+            timeframe=TIMEFRAME
         )
 
-        LOG.info(
-            "Balance      : $%.2f",
-            balance,
-        )
-
-        # ----------------------------------------------------
-        # SAFETY
-        # ----------------------------------------------------
-
-        if (
-            not CFG.live_trading
-            and
-            not demo
-        ):
-
-            raise RuntimeError(
-                "Connected account is LIVE. "
-                "LIVE_TRADING=false prevents "
-                "live trading."
-            )
-
-        # ----------------------------------------------------
-        # ASSET
-        # ----------------------------------------------------
-
-        assets = await api.active_assets()
-
-        matching_assets = [
-            asset
-            for asset in assets
-            if asset.get("symbol")
-            == CFG.asset
-        ]
-
-        if not matching_assets:
-
-            raise RuntimeError(
-                f"{CFG.asset} was not found "
-                "in active_assets()."
-            )
-
-        LOG.info(
-            "Asset found: %s",
-            matching_assets[0],
-        )
-
-        # ----------------------------------------------------
-        # INITIAL HISTORY
-        # ----------------------------------------------------
-
-        history_count = max(
-            CFG.lookback_window + 20,
-            80,
-        )
-
-        LOG.info(
-            "Downloading %d historical "
-            "15-second candles...",
-            history_count,
-        )
-
-        raw_history = await api.get_candles(
-            CFG.asset,
-            CFG.timeframe_seconds,
-            history_count,
-        )
-
-        history = sorted(
-            [
-                parse_candle(candle)
-                for candle in raw_history
-            ],
-            key=lambda candle:
-            candle.time,
-        )
-
-        LOG.info(
-            "Historical candles loaded: %d",
-            len(history),
-        )
-
-        if len(history) < (
-            CFG.lookback_window + 4
-        ):
-
-            raise RuntimeError(
-                "Not enough historical candles. "
-                f"Received {len(history)}, "
-                f"need at least "
-                f"{CFG.lookback_window + 4}."
-            )
-
-        # ----------------------------------------------------
-        # SUBSCRIBE
-        # ----------------------------------------------------
-
-        LOG.info(
-            "Subscribing to %s "
-            "at %d-second timeframe...",
-            CFG.asset,
-            CFG.timeframe_seconds,
-        )
-
-        stream = await (
-            api.subscribe_symbol_timed(
-                CFG.asset,
-                timedelta(
-                    seconds=CFG.timeframe_seconds
-                ),
-            )
-        )
-
-        LOG.info(
-            "15-second candle stream active."
-        )
-
-        # ----------------------------------------------------
-        # LOOP
-        # ----------------------------------------------------
-
-        manager = TradeManager()
-
-        last_candle_timestamp = None
+        log("Subscription successful.")
 
         async for raw_candle in stream:
 
-            if STOP_EVENT.is_set():
+            if not running:
                 break
 
-            try:
+            candle = normalize_candle(raw_candle)
 
-                candle = parse_candle(
-                    raw_candle
-                )
-
-            except Exception:
-
-                LOG.exception(
-                    "Unable to parse "
-                    "incoming candle: %r",
-                    raw_candle,
-                )
-
+            if candle is None:
                 continue
 
-            # ------------------------------------------------
-            # DUPLICATE PROTECTION
-            # ------------------------------------------------
+            await process_closed_candle(candle)
 
-            if (
-                last_candle_timestamp
-                == candle.time
-            ):
-                continue
+    except AttributeError:
 
-            last_candle_timestamp = (
-                candle.time
-            )
-
-            # ------------------------------------------------
-            # UPDATE HISTORY
-            # ------------------------------------------------
-
-            if history:
-
-                # Replace overlapping candle.
-
-                if (
-                    abs(
-                        history[-1].time
-                        - candle.time
-                    )
-                    < CFG.timeframe_seconds
-                ):
-
-                    history[-1] = candle
-
-                else:
-
-                    history.append(candle)
-
-            else:
-
-                history.append(candle)
-
-            # Keep memory bounded.
-
-            history = history[
-                -(
-                    CFG.lookback_window
-                    + 80
-                ):
-            ]
-
-            # ------------------------------------------------
-            # DISPLAY CLOSED CANDLE
-            # ------------------------------------------------
-
-            timestamp = datetime.fromtimestamp(
-                candle.time,
-                tz=timezone.utc,
-            ).strftime("%H:%M:%S")
-
-            signal_data = find_signal(
-                history
-            )
-
-            if signal_data:
-
-                signal_text = (
-                    signal_data["direction"]
-                    + "/"
-                    + signal_data["pattern"]
-                )
-
-            else:
-
-                signal_text = "NONE"
-
-            LOG.info(
-                "CLOSED %s | "
-                "O %.6f | "
-                "H %.6f | "
-                "L %.6f | "
-                "C %.6f | "
-                "SIGNAL=%s",
-                timestamp,
-                candle.open,
-                candle.high,
-                candle.low,
-                candle.close,
-                signal_text,
-            )
-
-            # ------------------------------------------------
-            # SIGNAL
-            # ------------------------------------------------
-
-            if not signal_data:
-                continue
-
-            zone = signal_data[
-                "zone"
-            ]
-
-            # ------------------------------------------------
-            # ONE TRADE PER ZONE TOUCH
-            # ------------------------------------------------
-
-            if manager.zone_is_locked(
-                zone,
-                candle.close,
-            ):
-
-                LOG.info(
-                    "Signal blocked: "
-                    "zone is still locked."
-                )
-
-                continue
-
-            # ------------------------------------------------
-            # TRADE
-            # ------------------------------------------------
-
-            await place_trade(
-                api,
-                signal_data,
-                manager,
-            )
-
-    finally:
-
-        LOG.info(
-            "Shutting down Pocket Option client..."
+        log(
+            "The installed BinaryOptionsTools-v2 version "
+            "does not expose subscribe_candles() under "
+            "that exact method name."
         )
 
-        try:
+        raise
 
-            await api.shutdown()
+    except Exception as exc:
 
-        except Exception:
+        log(
+            f"Stream error: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
-            LOG.exception(
-                "Error during shutdown."
-            )
+        raise
 
 
 # ============================================================
-# SIGNAL HANDLERS
+# CLIENT STARTUP
 # ============================================================
 
-def install_signal_handlers():
+async def start_client(PocketOptionAsync):
 
-    def stop_handler(
-        *_args
-    ):
+    global client
 
-        LOG.info(
-            "Shutdown signal received."
+    if not SSID:
+
+        raise RuntimeError(
+            "POCKET_OPTION_SSID is not configured."
         )
 
-        STOP_EVENT.set()
+    log("Creating PocketOptionAsync client...")
 
-    for sig in (
-        signal.SIGINT,
-        signal.SIGTERM,
-    ):
+    client = PocketOptionAsync(
+        ssid=SSID
+    )
 
-        try:
+    log("Client created.")
 
-            signal.signal(
-                sig,
-                stop_handler,
-            )
+    # Allow connection initialization.
+    await asyncio.sleep(5)
 
-        except (
-            ValueError,
-            OSError,
-        ):
+    return client
 
-            pass
+
+# ============================================================
+# ACCOUNT INFORMATION
+# ============================================================
+
+async def show_account():
+
+    try:
+
+        is_demo = await client.is_demo()
+
+        log(
+            "Account type: "
+            + ("DEMO" if is_demo else "REAL")
+        )
+
+    except Exception as exc:
+
+        log(
+            f"Could not determine account type: {exc}"
+        )
+
+    try:
+
+        balance = await client.get_balance()
+
+        log(
+            f"Balance: ${float(balance):,.2f}"
+        )
+
+    except Exception as exc:
+
+        log(
+            f"Could not retrieve balance: {exc}"
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def main():
+
+    print_header()
+
+    PocketOptionAsync = import_library()
+
+    await start_client(
+        PocketOptionAsync
+    )
+
+    await show_account()
+
+    log(
+        f"Starting live {TIMEFRAME}s "
+        f"{ASSET} strategy..."
+    )
+
+    await handle_tick_stream()
 
 
 # ============================================================
@@ -1440,34 +958,55 @@ def install_signal_handlers():
 
 if __name__ == "__main__":
 
-    logging.basicConfig(
-        level=os.getenv(
-            "LOG_LEVEL",
-            "INFO",
-        ),
-        format=(
-            "%(asctime)s | "
-            "%(levelname)s | "
-            "%(message)s"
-        ),
-    )
-
-    install_signal_handlers()
-
     try:
 
-        asyncio.run(
-            run_bot()
-        )
+        asyncio.run(main())
 
     except KeyboardInterrupt:
 
         pass
 
-    except Exception:
+    except Exception as exc:
 
-        LOG.exception(
-            "BOT FAILED"
+        print()
+        print("=" * 80)
+        print("BOT STOPPED")
+        print("=" * 80)
+        print(
+            f"Error type : {type(exc).__name__}"
         )
+        print(
+            f"Error      : {exc}"
+        )
+        print("=" * 80)
 
-        raise
+        sys.exit(1)
+
+    finally:
+
+        if client is not None:
+
+            try:
+
+                shutdown = getattr(
+                    client,
+                    "shutdown",
+                    None
+                )
+
+                if shutdown:
+
+                    result = shutdown()
+
+                    if asyncio.iscoroutine(result):
+
+                        try:
+                            asyncio.run(result)
+                        except RuntimeError:
+                            pass
+
+            except Exception:
+
+                pass
+
+        print("Bot shutdown complete.")

@@ -1,39 +1,9 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Virtual environments
+.env
 .venv/
 venv/
-env/
-ENV/
-
-# Environment files
-.env
-.env.*
-!.env.example
-
-# IDE
+__pycache__/
+*.py[cod]
+*.log
 .vscode/
 .idea/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-
-# Test/cache files
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Build artifacts
-build/
-dist/
-*.egg-info/
-
-# Local development
-*.local

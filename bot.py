@@ -1,8 +1,8 @@
 import asyncio
-import json
 import os
 import signal
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 
 # ============================================================
-# ENVIRONMENT / CONFIGURATION
+# CONFIGURATION
 # ============================================================
 
 load_dotenv()
@@ -19,15 +19,15 @@ load_dotenv()
 SSID = os.getenv("POCKET_OPTION_SSID", "").strip()
 
 ASSET = os.getenv("ASSET", "AUDUSD_otc")
+
 TIMEFRAME = int(os.getenv("TIMEFRAME", "15"))
+EXPIRY_SECONDS = int(os.getenv("EXPIRY_SECONDS", "15"))
 
 TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "2500"))
-EXPIRY_SECONDS = int(os.getenv("EXPIRY_SECONDS", "15"))
 
 LOOKBACK_WINDOW = int(os.getenv("LOOKBACK_WINDOW", "50"))
 
-# Strategy requires C0 + C-1 + C-2 + C-3.
-TREND_CANDLES = 3
+TREND_CANDLES = int(os.getenv("TREND_CANDLES", "3"))
 
 ZONE_TOLERANCE_MULTIPLIER = float(
     os.getenv("ZONE_TOLERANCE_MULTIPLIER", "0.75")
@@ -61,21 +61,39 @@ MIN_RANGE_FILTER = float(
     os.getenv("MIN_RANGE_FILTER", "0.50")
 )
 
-ONE_TRADE_PER_ZONE = (
-    os.getenv("ONE_TRADE_PER_ZONE", "true").lower()
-    in ("1", "true", "yes", "on")
+PIVOT_STRENGTH = int(
+    os.getenv("PIVOT_STRENGTH", "3")
 )
 
-# Historical data window used during startup.
-HISTORY_HOURS = float(
-    os.getenv("HISTORY_HOURS", "2")
-)
+ONE_TRADE_PER_ZONE = True
 
-# Maximum number of completed candles kept in memory.
-MAX_CANDLE_BUFFER = max(
-    LOOKBACK_WINDOW + 20,
-    100
-)
+
+# ============================================================
+# HARD SAFETY VALIDATION
+# ============================================================
+
+if TIMEFRAME != 15:
+    raise RuntimeError(
+        "This bot is specifically configured for a 15-second strategy. "
+        "TIMEFRAME must be 15."
+    )
+
+if EXPIRY_SECONDS != 15:
+    raise RuntimeError(
+        "This bot is specifically configured for a 15-second expiry. "
+        "EXPIRY_SECONDS must be 15."
+    )
+
+if LOOKBACK_WINDOW < 4:
+    raise RuntimeError(
+        "LOOKBACK_WINDOW must be at least 4 because the strategy "
+        "requires C-1, C-2 and C-3."
+    )
+
+if TREND_CANDLES != 3:
+    raise RuntimeError(
+        "This strategy requires exactly 3 trend-precondition candles."
+    )
 
 
 # ============================================================
@@ -83,30 +101,26 @@ MAX_CANDLE_BUFFER = max(
 # ============================================================
 
 running = True
-
 client = None
 
-candles: list["Candle"] = []
+candles = []
 
-# Persistent zone locks.
+# Stable zone locks.
 #
-# IMPORTANT:
-# These are NOT keyed by the dynamically recalculated zone
-# bounds. Each lock represents the actual price area that
-# triggered a trade.
-active_zone_locks: list["ZoneLock"] = []
+# Each entry:
+# (
+#     zone_type,
+#     zone_low,
+#     zone_high
+# )
+#
+# We deliberately store the actual price region instead of a
+# recalculated floating center.
+active_zone_locks = []
 
-# All outstanding trade tasks.
-trade_tasks: set[asyncio.Task] = set()
+last_processed_candle_timestamp = None
 
-# Prevent duplicate processing of the same closed candle.
-last_processed_candle_timestamp: Optional[int] = None
-
-# Async shutdown event.
-shutdown_event: Optional[asyncio.Event] = None
-
-# Main stream task.
-stream_task: Optional[asyncio.Task] = None
+trade_tasks = set()
 
 
 # ============================================================
@@ -122,19 +136,19 @@ class Candle:
     close: float
 
     @property
-    def range(self) -> float:
+    def range(self):
         return self.high - self.low
 
     @property
-    def body(self) -> float:
+    def body(self):
         return abs(self.close - self.open)
 
     @property
-    def upper_wick(self) -> float:
+    def upper_wick(self):
         return self.high - max(self.open, self.close)
 
     @property
-    def lower_wick(self) -> float:
+    def lower_wick(self):
         return min(self.open, self.close) - self.low
 
 
@@ -146,193 +160,58 @@ class Zone:
     zone_type: str
 
     @property
-    def center(self) -> float:
-        return (self.zone_low + self.zone_high) / 2
-
-
-@dataclass
-class ZoneLock:
-    """
-    Persistent lock created when a trade fires.
-
-    The lock is deliberately independent of the currently
-    recalculated S/R zones.
-    """
-
-    zone_type: str
-    zone_low: float
-    zone_high: float
-    created_at: int
-    signal_candle_timestamp: int
-
-    @property
-    def center(self) -> float:
-        return (self.zone_low + self.zone_high) / 2
+    def center(self):
+        return (self.zone_low + self.zone_high) / 2.0
 
 
 # ============================================================
 # LOGGING
 # ============================================================
 
-def log(message: str) -> None:
+def log(message: str):
     now = datetime.now().strftime("%H:%M:%S")
     print(f"[{now}] {message}", flush=True)
 
 
-def print_header() -> None:
+def print_header():
+
     print("=" * 80)
     print("POCKET OPTION 15s REVERSAL BOT")
     print("=" * 80)
-    print(f"Asset             : {ASSET}")
-    print(f"Timeframe         : {TIMEFRAME}s")
-    print(f"Trade amount      : ${TRADE_AMOUNT:,.2f}")
-    print(f"Expiry            : {EXPIRY_SECONDS}s")
-    print(f"S/R lookback      : {LOOKBACK_WINDOW} candles")
-    print(f"Zone tolerance    : {ZONE_TOLERANCE_MULTIPLIER}x avg range")
-    print(f"Zone touches      : {MIN_ZONE_TOUCHES}-{MAX_ZONE_TOUCHES}")
-    print(f"Min range filter  : {MIN_RANGE_FILTER}x avg range")
+
+    print(f"Asset          : {ASSET}")
+    print(f"Timeframe      : {TIMEFRAME}s")
+    print(f"Trade amount   : ${TRADE_AMOUNT:,.2f}")
+    print(f"Expiry         : {EXPIRY_SECONDS}s")
+    print(f"S/R lookback   : {LOOKBACK_WINDOW} candles")
+
+    print("-" * 80)
+    print("15s MODE       : LOCAL / TIME-ALIGNED CANDLE ENGINE")
+    print("Native 15s     : NOT REQUIRED")
     print("=" * 80)
-
-
-# ============================================================
-# CONFIGURATION VALIDATION
-# ============================================================
-
-def validate_configuration() -> None:
-
-    if not SSID:
-        raise RuntimeError(
-            "POCKET_OPTION_SSID is not configured."
-        )
-
-    if TIMEFRAME != 15:
-        raise ValueError(
-            "This strategy is configured for a 15-second timeframe. "
-            f"TIMEFRAME={TIMEFRAME} is invalid."
-        )
-
-    if EXPIRY_SECONDS != 15:
-        raise ValueError(
-            "This strategy uses a one-candle 15-second expiry. "
-            f"EXPIRY_SECONDS={EXPIRY_SECONDS} is invalid."
-        )
-
-    if TRADE_AMOUNT <= 0:
-        raise ValueError(
-            "TRADE_AMOUNT must be greater than zero."
-        )
-
-    if LOOKBACK_WINDOW < TREND_CANDLES + 1:
-        raise ValueError(
-            f"LOOKBACK_WINDOW must be at least "
-            f"{TREND_CANDLES + 1}. "
-            f"Current value: {LOOKBACK_WINDOW}"
-        )
-
-    if MIN_ZONE_TOUCHES < 1:
-        raise ValueError(
-            "MIN_ZONE_TOUCHES must be at least 1."
-        )
-
-    if MAX_ZONE_TOUCHES < MIN_ZONE_TOUCHES:
-        raise ValueError(
-            "MAX_ZONE_TOUCHES cannot be smaller than "
-            "MIN_ZONE_TOUCHES."
-        )
-
-    if ZONE_TOLERANCE_MULTIPLIER <= 0:
-        raise ValueError(
-            "ZONE_TOLERANCE_MULTIPLIER must be greater than zero."
-        )
-
-    if DOJI_BODY_MAX_PCT <= 0:
-        raise ValueError(
-            "DOJI_BODY_MAX_PCT must be greater than zero."
-        )
-
-    if DOJI_WICK_MIN_PCT <= 0:
-        raise ValueError(
-            "DOJI_WICK_MIN_PCT must be greater than zero."
-        )
-
-    if STAR_HAMMER_BODY_MAX_PCT <= 0:
-        raise ValueError(
-            "STAR_HAMMER_BODY_MAX_PCT must be greater than zero."
-        )
-
-    if STAR_HAMMER_WICK_MULTIPLIER <= 0:
-        raise ValueError(
-            "STAR_HAMMER_WICK_MULTIPLIER must be greater than zero."
-        )
-
-    if MIN_RANGE_FILTER < 0:
-        raise ValueError(
-            "MIN_RANGE_FILTER cannot be negative."
-        )
 
 
 # ============================================================
 # SHUTDOWN
 # ============================================================
 
-def request_shutdown(reason: str = "shutdown signal") -> None:
-    """
-    Thread/signal-safe shutdown request.
-
-    The signal handler itself does NOT perform async work.
-    It only tells the running event loop to shut down.
-    """
+def shutdown_handler(signum, frame):
 
     global running
 
     if not running:
         return
 
-    running = False
-
-    print()
-    log(f"Shutdown requested: {reason}")
-
-    if shutdown_event is not None:
-
-        try:
-            loop = asyncio.get_running_loop()
-            loop.call_soon_threadsafe(
-                shutdown_event.set
-            )
-        except RuntimeError:
-            # No running loop.
-            pass
-
-
-def shutdown_handler(signum, frame) -> None:
-    signame = signal.Signals(signum).name
-
-    request_shutdown(
-        f"{signame}"
+    log(
+        f"Shutdown signal received "
+        f"({signal.Signals(signum).name})."
     )
 
+    running = False
 
-def install_signal_handlers() -> None:
 
-    try:
-        signal.signal(
-            signal.SIGINT,
-            shutdown_handler
-        )
-
-        signal.signal(
-            signal.SIGTERM,
-            shutdown_handler
-        )
-
-        log("SIGINT/SIGTERM handlers installed.")
-
-    except Exception as exc:
-        log(
-            f"Could not install signal handlers: "
-            f"{type(exc).__name__}: {exc}"
-        )
+signal.signal(signal.SIGINT, shutdown_handler)
+signal.signal(signal.SIGTERM, shutdown_handler)
 
 
 # ============================================================
@@ -342,8 +221,13 @@ def install_signal_handlers() -> None:
 def import_library():
 
     try:
+
         from BinaryOptionsToolsV2.pocketoption import (
             PocketOptionAsync
+        )
+
+        log(
+            "BinaryOptionsToolsV2.PocketOptionAsync imported successfully."
         )
 
         return PocketOptionAsync
@@ -354,22 +238,45 @@ def import_library():
         print("=" * 80)
         print("ERROR: Could not import BinaryOptionsToolsV2")
         print("=" * 80)
-        print(f"Original error: {exc}")
         print()
-        print(
-            "Expected import:"
-        )
+        print("Expected import:")
         print(
             "from BinaryOptionsToolsV2.pocketoption "
             "import PocketOptionAsync"
         )
-        print("=" * 80)
+        print()
+        print(f"Original error: {exc}")
+        print()
 
         raise
 
 
 # ============================================================
-# CANDLE NORMALIZATION
+# GENERIC VALUE EXTRACTION
+# ============================================================
+
+def get_value(obj: Any, *names):
+
+    if isinstance(obj, dict):
+
+        for name in names:
+
+            if name in obj:
+                return obj[name]
+
+        return None
+
+    for name in names:
+
+        if hasattr(obj, name):
+
+            return getattr(obj, name)
+
+    return None
+
+
+# ============================================================
+# NORMALIZE CANDLE
 # ============================================================
 
 def normalize_candle(raw: Any) -> Optional[Candle]:
@@ -379,109 +286,38 @@ def normalize_candle(raw: Any) -> Optional[Candle]:
         if isinstance(raw, Candle):
             return raw
 
-        # ----------------------------------------------------
-        # Dictionary
-        # ----------------------------------------------------
-
-        if isinstance(raw, dict):
-
-            timestamp = raw.get(
-                "timestamp",
-                raw.get(
-                    "time",
-                    raw.get(
-                        "from",
-                        raw.get("at")
-                    )
-                )
-            )
-
-            open_price = raw.get(
-                "open",
-                raw.get("o")
-            )
-
-            high_price = raw.get(
-                "high",
-                raw.get("h")
-            )
-
-            low_price = raw.get(
-                "low",
-                raw.get("l")
-            )
-
-            close_price = raw.get(
-                "close",
-                raw.get("c")
-            )
-
-            if None in (
-                timestamp,
-                open_price,
-                high_price,
-                low_price,
-                close_price
-            ):
-                return None
-
-            return Candle(
-                timestamp=int(float(timestamp)),
-                open=float(open_price),
-                high=float(high_price),
-                low=float(low_price),
-                close=float(close_price)
-            )
-
-        # ----------------------------------------------------
-        # JSON string
-        # ----------------------------------------------------
-
-        if isinstance(raw, str):
-
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError:
-                return None
-
-            return normalize_candle(parsed)
-
-        # ----------------------------------------------------
-        # Object with attributes
-        # ----------------------------------------------------
-
-        timestamp = getattr(
+        timestamp = get_value(
             raw,
             "timestamp",
-            getattr(
-                raw,
-                "time",
-                None
-            )
+            "time",
+            "from",
+            "at",
+            "open_time",
+            "start"
         )
 
-        open_price = getattr(
+        open_price = get_value(
             raw,
             "open",
-            None
+            "o"
         )
 
-        high_price = getattr(
+        high_price = get_value(
             raw,
             "high",
-            None
+            "h"
         )
 
-        low_price = getattr(
+        low_price = get_value(
             raw,
             "low",
-            None
+            "l"
         )
 
-        close_price = getattr(
+        close_price = get_value(
             raw,
             "close",
-            None
+            "c"
         )
 
         if None in (
@@ -491,10 +327,17 @@ def normalize_candle(raw: Any) -> Optional[Candle]:
             low_price,
             close_price
         ):
+
             return None
 
+        timestamp = int(float(timestamp))
+
+        # Some feeds can return milliseconds.
+        if timestamp > 10_000_000_000:
+            timestamp //= 1000
+
         return Candle(
-            timestamp=int(float(timestamp)),
+            timestamp=timestamp,
             open=float(open_price),
             high=float(high_price),
             low=float(low_price),
@@ -512,6 +355,40 @@ def normalize_candle(raw: Any) -> Optional[Candle]:
 
 
 # ============================================================
+# CANDLE DEDUPLICATION
+# ============================================================
+
+def append_closed_candle(candle: Candle):
+
+    global candles
+
+    # Existing timestamp:
+    for index, existing in enumerate(candles):
+
+        if existing.timestamp == candle.timestamp:
+
+            # Replace only if the incoming candle is considered
+            # the same closed candle.
+            candles[index] = candle
+            return False
+
+    candles.append(candle)
+
+    candles.sort(
+        key=lambda c: c.timestamp
+    )
+
+    # Keep enough history for lookback + pivots.
+    max_history = LOOKBACK_WINDOW + 20
+
+    if len(candles) > max_history:
+
+        candles = candles[-max_history:]
+
+    return True
+
+
+# ============================================================
 # CANDLE PATTERNS
 # ============================================================
 
@@ -521,6 +398,7 @@ def is_gravestone_doji(candle: Candle) -> bool:
         return False
 
     return (
+
         candle.body
         <= DOJI_BODY_MAX_PCT * candle.range
 
@@ -542,6 +420,7 @@ def is_dragonfly_doji(candle: Candle) -> bool:
         return False
 
     return (
+
         candle.body
         <= DOJI_BODY_MAX_PCT * candle.range
 
@@ -567,14 +446,16 @@ def is_shooting_star(candle: Candle) -> bool:
     if body <= 0:
         return False
 
-    # Body must be in lower third.
     body_in_lower_third = (
+
         max(candle.open, candle.close)
+
         <= candle.low
         + candle.range * (1 / 3)
     )
 
     return (
+
         body
         <= STAR_HAMMER_BODY_MAX_PCT * candle.range
 
@@ -599,14 +480,16 @@ def is_hammer(candle: Candle) -> bool:
     if body <= 0:
         return False
 
-    # Body must be in upper third.
     body_in_upper_third = (
+
         min(candle.open, candle.close)
+
         >= candle.low
         + candle.range * (2 / 3)
     )
 
     return (
+
         body
         <= STAR_HAMMER_BODY_MAX_PCT * candle.range
 
@@ -625,12 +508,13 @@ def is_hammer(candle: Candle) -> bool:
 # TREND GATES
 # ============================================================
 
-def buy_trend_gate(history: list[Candle]) -> bool:
+def buy_trend_gate(history):
 
-    if len(history) < TREND_CANDLES + 1:
+    if len(history) < 4:
         return False
 
-    # C0 = history[-1]
+    # C0 = latest closed candle
+    #
     # C-1 = history[-2]
     # C-2 = history[-3]
     # C-3 = history[-4]
@@ -646,9 +530,9 @@ def buy_trend_gate(history: list[Candle]) -> bool:
     )
 
 
-def sell_trend_gate(history: list[Candle]) -> bool:
+def sell_trend_gate(history):
 
-    if len(history) < TREND_CANDLES + 1:
+    if len(history) < 4:
         return False
 
     c1 = history[-2]
@@ -667,10 +551,10 @@ def sell_trend_gate(history: list[Candle]) -> bool:
 # ============================================================
 
 def find_pivot_high(
-    data: list[Candle],
-    index: int,
-    strength: int = 3
-) -> bool:
+    data,
+    index,
+    strength=PIVOT_STRENGTH
+):
 
     if index - strength < 0:
         return False
@@ -695,10 +579,10 @@ def find_pivot_high(
 
 
 def find_pivot_low(
-    data: list[Candle],
-    index: int,
-    strength: int = 3
-) -> bool:
+    data,
+    index,
+    strength=PIVOT_STRENGTH
+):
 
     if index - strength < 0:
         return False
@@ -726,12 +610,12 @@ def find_pivot_low(
 # RANGE
 # ============================================================
 
-def average_range(data: list[Candle]) -> float:
+def average_range(data):
 
     valid = [
-        candle.range
-        for candle in data
-        if candle.range > 0
+        c.range
+        for c in data
+        if c.range > 0
     ]
 
     if not valid:
@@ -745,17 +629,17 @@ def average_range(data: list[Candle]) -> float:
 # ============================================================
 
 def cluster_prices(
-    prices: list[float],
-    tolerance: float,
-    zone_type: str
-) -> list[Zone]:
+    prices,
+    tolerance,
+    zone_type
+):
 
     if not prices:
         return []
 
     prices = sorted(prices)
 
-    clusters: list[list[float]] = []
+    clusters = []
 
     current = [prices[0]]
 
@@ -764,15 +648,17 @@ def cluster_prices(
         center = sum(current) / len(current)
 
         if abs(price - center) <= tolerance:
+
             current.append(price)
 
         else:
+
             clusters.append(current)
             current = [price]
 
     clusters.append(current)
 
-    zones: list[Zone] = []
+    zones = []
 
     for cluster in clusters:
 
@@ -784,7 +670,7 @@ def cluster_prices(
         if touch_count > MAX_ZONE_TOUCHES:
             continue
 
-        center = sum(cluster) / len(cluster)
+        center = sum(cluster) / touch_count
 
         zones.append(
             Zone(
@@ -799,12 +685,10 @@ def cluster_prices(
 
 
 # ============================================================
-# BUILD S/R ZONES
+# BUILD SUPPORT / RESISTANCE
 # ============================================================
 
-def build_zones(
-    data: list[Candle]
-) -> tuple[list[Zone], list[Zone]]:
+def build_zones(data):
 
     if len(data) < LOOKBACK_WINDOW:
         return [], []
@@ -821,18 +705,19 @@ def build_zones(
         * ZONE_TOLERANCE_MULTIPLIER
     )
 
-    resistance_pivots: list[float] = []
-    support_pivots: list[float] = []
+    resistance_pivots = []
+    support_pivots = []
 
-    # Strength 3 = three candles on each side.
     for i in range(len(data)):
 
-        if find_pivot_high(data, i, 3):
+        if find_pivot_high(data, i):
+
             resistance_pivots.append(
                 data[i].high
             )
 
-        if find_pivot_low(data, i, 3):
+        if find_pivot_low(data, i):
+
             support_pivots.append(
                 data[i].low
             )
@@ -849,20 +734,14 @@ def build_zones(
         "support"
     )
 
-    return (
-        support_zones,
-        resistance_zones
-    )
+    return support_zones, resistance_zones
 
 
 # ============================================================
 # ZONE MATCHING
 # ============================================================
 
-def price_in_zone(
-    price: float,
-    zone: Zone
-) -> bool:
+def price_in_zone(price, zone):
 
     return (
         zone.zone_low
@@ -871,15 +750,12 @@ def price_in_zone(
     )
 
 
-def find_support_zone(
-    price: float,
-    zones: list[Zone]
-) -> Optional[Zone]:
+def find_support_zone(price, zones):
 
     candidates = [
-        zone
-        for zone in zones
-        if price_in_zone(price, zone)
+        z
+        for z in zones
+        if price_in_zone(price, z)
     ]
 
     if not candidates:
@@ -887,20 +763,18 @@ def find_support_zone(
 
     return min(
         candidates,
-        key=lambda zone:
-        abs(zone.center - price)
+        key=lambda z: abs(
+            z.center - price
+        )
     )
 
 
-def find_resistance_zone(
-    price: float,
-    zones: list[Zone]
-) -> Optional[Zone]:
+def find_resistance_zone(price, zones):
 
     candidates = [
-        zone
-        for zone in zones
-        if price_in_zone(price, zone)
+        z
+        for z in zones
+        if price_in_zone(price, z)
     ]
 
     if not candidates:
@@ -908,152 +782,133 @@ def find_resistance_zone(
 
     return min(
         candidates,
-        key=lambda zone:
-        abs(zone.center - price)
+        key=lambda z: abs(
+            z.center - price
+        )
     )
 
 
 # ============================================================
-# STABLE ZONE LOCKING
+# STABLE ZONE LOCKS
 # ============================================================
 
-def zones_overlap(
-    low_a: float,
-    high_a: float,
-    low_b: float,
-    high_b: float
-) -> bool:
+def zone_lock_matches(
+    zone_type,
+    zone_low,
+    zone_high
+):
 
-    return (
-        max(low_a, low_b)
-        <= min(high_a, high_b)
-    )
+    for locked_type, locked_low, locked_high in active_zone_locks:
 
-
-def zone_is_locked(
-    zone: Zone
-) -> bool:
-
-    if not ONE_TRADE_PER_ZONE:
-        return False
-
-    for lock in active_zone_locks:
-
-        if lock.zone_type != zone.zone_type:
+        if locked_type != zone_type:
             continue
 
-        if zones_overlap(
-            zone.zone_low,
-            zone.zone_high,
-            lock.zone_low,
-            lock.zone_high
+        # Overlap means we are still in the same price region.
+        if (
+            zone_low <= locked_high
+            and
+            zone_high >= locked_low
         ):
+
             return True
 
     return False
 
 
-def lock_zone(
-    zone: Zone,
-    signal_candle_timestamp: int
-) -> None:
+def lock_zone(zone: Zone):
 
     if not ONE_TRADE_PER_ZONE:
         return
 
+    if zone_lock_matches(
+        zone.zone_type,
+        zone.zone_low,
+        zone.zone_high
+    ):
+        return
+
     active_zone_locks.append(
-        ZoneLock(
-            zone_type=zone.zone_type,
-            zone_low=zone.zone_low,
-            zone_high=zone.zone_high,
-            created_at=int(
-                datetime.now(
-                    timezone.utc
-                ).timestamp()
-            ),
-            signal_candle_timestamp=(
-                signal_candle_timestamp
-            )
+        (
+            zone.zone_type,
+            zone.zone_low,
+            zone.zone_high
         )
     )
 
     log(
-        "ZONE LOCKED | "
+        f"Zone locked | "
         f"{zone.zone_type.upper()} | "
         f"{zone.zone_low:.6f} - "
-        f"{zone.zone_high:.6f} | "
-        f"touches={zone.touch_count}"
+        f"{zone.zone_high:.6f}"
     )
 
 
-def unlock_zones_if_price_exited(
-    price: float
-) -> None:
+def unlock_zones_if_price_exited(price):
 
-    if not active_zone_locks:
-        return
+    global active_zone_locks
 
-    remaining: list[ZoneLock] = []
+    remaining = []
 
-    for lock in active_zone_locks:
+    for zone_type, zone_low, zone_high in active_zone_locks:
 
-        # Keep lock while price remains inside the
-        # exact region that generated the signal.
-        if (
-            lock.zone_low
-            <= price
-            <= lock.zone_high
-        ):
+        # Keep lock while price remains inside.
+        if zone_low <= price <= zone_high:
 
-            remaining.append(lock)
-
-        else:
-
-            log(
-                "ZONE UNLOCKED | "
-                f"{lock.zone_type.upper()} | "
-                f"{lock.zone_low:.6f} - "
-                f"{lock.zone_high:.6f} | "
-                f"price={price:.6f}"
+            remaining.append(
+                (
+                    zone_type,
+                    zone_low,
+                    zone_high
+                )
             )
 
-    active_zone_locks.clear()
-    active_zone_locks.extend(remaining)
+    removed = len(active_zone_locks) - len(remaining)
+
+    active_zone_locks = remaining
+
+    if removed:
+
+        log(
+            f"Zone lock(s) released: {removed}"
+        )
 
 
 # ============================================================
 # SIGNAL EVALUATION
 # ============================================================
 
-def evaluate_signal(
-    data: list[Candle]
-) -> Optional[dict]:
+def evaluate_signal(data):
 
-    # --------------------------------------------------------
-    # HARD DATA REQUIREMENT
-    # --------------------------------------------------------
-
-    required_candles = max(
-        LOOKBACK_WINDOW,
-        TREND_CANDLES + 1
-    )
-
-    if len(data) < required_candles:
+    # Explicit lower-bound safety.
+    if LOOKBACK_WINDOW < 4:
+        log(
+            "Signal evaluation disabled: "
+            "LOOKBACK_WINDOW < 4."
+        )
         return None
 
-    # --------------------------------------------------------
-    # C0 = most recently closed candle.
-    # --------------------------------------------------------
+    if len(data) < LOOKBACK_WINDOW:
+        return None
+
+    if len(data) < 4:
+        return None
 
     c0 = data[-1]
 
     # --------------------------------------------------------
-    # Minimum range filter.
+    # HARD TREND GATE FIRST
     # --------------------------------------------------------
 
-    recent = data[-LOOKBACK_WINDOW:]
+    buy_trend = buy_trend_gate(data)
+    sell_trend = sell_trend_gate(data)
 
-    avg_range = average_range(recent)
+    # --------------------------------------------------------
+    # RANGE FILTER
+    # --------------------------------------------------------
+
+    avg_range = average_range(
+        data[-LOOKBACK_WINDOW:]
+    )
 
     if avg_range <= 0:
         return None
@@ -1071,31 +926,23 @@ def evaluate_signal(
         return None
 
     # --------------------------------------------------------
-    # BUILD ZONES FROM CLOSED CANDLES ONLY
+    # BUILD ZONES FROM CLOSED CANDLES
     # --------------------------------------------------------
 
-    support_zones, resistance_zones = (
-        build_zones(data)
-    )
+    support_zones, resistance_zones = build_zones(data)
 
     # --------------------------------------------------------
     # BUY
-    #
-    # Gate order:
-    #
-    # 1. Trend
-    # 2. Support zone
-    # 3. Pattern
     # --------------------------------------------------------
 
-    if buy_trend_gate(data):
+    if buy_trend:
 
         support_zone = find_support_zone(
             c0.low,
             support_zones
         )
 
-        if support_zone is not None:
+        if support_zone:
 
             dragonfly = is_dragonfly_doji(c0)
             hammer = is_hammer(c0)
@@ -1117,32 +964,19 @@ def evaluate_signal(
 
     # --------------------------------------------------------
     # SELL
-    #
-    # Gate order:
-    #
-    # 1. Trend
-    # 2. Resistance zone
-    # 3. Pattern
     # --------------------------------------------------------
 
-    if sell_trend_gate(data):
+    if sell_trend:
 
-        resistance_zone = (
-            find_resistance_zone(
-                c0.high,
-                resistance_zones
-            )
+        resistance_zone = find_resistance_zone(
+            c0.high,
+            resistance_zones
         )
 
-        if resistance_zone is not None:
+        if resistance_zone:
 
-            gravestone = (
-                is_gravestone_doji(c0)
-            )
-
-            shooting_star = (
-                is_shooting_star(c0)
-            )
+            gravestone = is_gravestone_doji(c0)
+            shooting_star = is_shooting_star(c0)
 
             if gravestone or shooting_star:
 
@@ -1163,55 +997,15 @@ def evaluate_signal(
 
 
 # ============================================================
-# TRADE TASK CLEANUP
-# ============================================================
-
-def trade_task_done(
-    task: asyncio.Task
-) -> None:
-
-    trade_tasks.discard(task)
-
-    try:
-        task.result()
-
-    except asyncio.CancelledError:
-        log("Trade task cancelled.")
-
-    except Exception as exc:
-        log(
-            "Trade task failed | "
-            f"{type(exc).__name__}: {exc}"
-        )
-
-
-def create_trade_task(
-    signal_data: dict
-) -> None:
-
-    task = asyncio.create_task(
-        execute_trade(signal_data)
-    )
-
-    trade_tasks.add(task)
-
-    task.add_done_callback(
-        trade_task_done
-    )
-
-
-# ============================================================
 # TRADE EXECUTION
 # ============================================================
 
-async def execute_trade(
-    signal_data: dict
-):
+async def execute_trade(signal_data):
 
     direction = signal_data["direction"]
     pattern = signal_data["pattern"]
-    zone: Zone = signal_data["zone"]
-    candle: Candle = signal_data["candle"]
+    zone = signal_data["zone"]
+    candle = signal_data["candle"]
 
     log("")
     log("=" * 70)
@@ -1222,57 +1016,53 @@ async def execute_trade(
     log(f"Pattern   : {pattern}")
 
     log(
+        f"Signal C0 : "
+        f"{datetime.fromtimestamp(candle.timestamp).strftime('%H:%M:%S')}"
+    )
+
+    log(
         f"Zone      : "
         f"{zone.zone_low:.6f} - "
         f"{zone.zone_high:.6f}"
     )
 
     log(
-        f"Signal C0 : "
-        f"{candle.timestamp}"
+        f"Touches   : {zone.touch_count}"
     )
 
     log(
-        f"Amount    : "
-        f"${TRADE_AMOUNT:,.2f}"
+        f"Amount    : ${TRADE_AMOUNT:,.2f}"
     )
 
     log(
-        f"Expiry    : "
-        f"{EXPIRY_SECONDS}s"
+        f"Expiry    : {EXPIRY_SECONDS}s"
     )
 
     log("=" * 70)
 
     try:
 
-        # ----------------------------------------------------
         # IMPORTANT:
         #
-        # BinaryOptionsTools-v2 uses:
+        # The library's documented async interface is:
         #
-        # buy(asset, amount, time)
-        # sell(asset, amount, time)
-        #
-        # NOT duration=...
-        # ----------------------------------------------------
+        # await client.buy(asset, amount, duration)
+        # await client.sell(asset, amount, duration)
 
         if direction == "BUY":
 
             result = await client.buy(
-                asset=ASSET,
-                amount=TRADE_AMOUNT,
-                time=EXPIRY_SECONDS,
-                check_win=False
+                ASSET,
+                TRADE_AMOUNT,
+                EXPIRY_SECONDS
             )
 
         else:
 
             result = await client.sell(
-                asset=ASSET,
-                amount=TRADE_AMOUNT,
-                time=EXPIRY_SECONDS,
-                check_win=False
+                ASSET,
+                TRADE_AMOUNT,
+                EXPIRY_SECONDS
             )
 
         log(
@@ -1281,54 +1071,7 @@ async def execute_trade(
             f"{result}"
         )
 
-        # ----------------------------------------------------
-        # Optional result check after expiry.
-        #
-        # This happens in the trade task, NOT in the
-        # candle-stream task, so it cannot block candle
-        # processing.
-        # ----------------------------------------------------
-
-        await asyncio.sleep(
-            EXPIRY_SECONDS + 1
-        )
-
-        if (
-            isinstance(result, tuple)
-            and len(result) >= 1
-        ):
-
-            trade_id = result[0]
-
-            try:
-
-                result_data = (
-                    await client.check_win(
-                        trade_id
-                    )
-                )
-
-                log(
-                    f"TRADE RESULT | "
-                    f"{trade_id} | "
-                    f"{result_data}"
-                )
-
-            except Exception as exc:
-
-                log(
-                    "Could not retrieve trade result | "
-                    f"{type(exc).__name__}: {exc}"
-                )
-
-    except asyncio.CancelledError:
-
-        log(
-            f"Trade task cancelled | "
-            f"{direction}"
-        )
-
-        raise
+        return result
 
     except Exception as exc:
 
@@ -1337,43 +1080,74 @@ async def execute_trade(
             f"{type(exc).__name__}: {exc}"
         )
 
+        return None
+
 
 # ============================================================
-# CLOSED CANDLE PROCESSOR
+# NON-BLOCKING TRADE TASK
 # ============================================================
 
-async def process_closed_candle(
-    candle: Candle
-) -> None:
+async def trade_task(signal_data):
+
+    try:
+
+        await execute_trade(signal_data)
+
+    except asyncio.CancelledError:
+
+        log("Trade task cancelled.")
+
+    except Exception as exc:
+
+        log(
+            f"Trade task error | "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+def launch_trade(signal_data):
+
+    task = asyncio.create_task(
+        trade_task(signal_data)
+    )
+
+    trade_tasks.add(task)
+
+    def done_callback(completed_task):
+
+        trade_tasks.discard(
+            completed_task
+        )
+
+        try:
+            completed_task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            log(
+                f"Background trade task failed | "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    task.add_done_callback(done_callback)
+
+
+# ============================================================
+# PROCESS CLOSED CANDLE
+# ============================================================
+
+async def process_closed_candle(candle):
 
     global last_processed_candle_timestamp
 
-    # --------------------------------------------------------
-    # DUPLICATE CANDLE PROTECTION
-    # --------------------------------------------------------
-
+    # Never process the same timestamp twice.
     if (
         last_processed_candle_timestamp
-        == candle.timestamp
-    ):
-        return
-
-    # --------------------------------------------------------
-    # A candle timestamp older than the last processed candle
-    # must never be inserted into the live history.
-    # --------------------------------------------------------
-
-    if (
-        last_processed_candle_timestamp is not None
+        is not None
         and
         candle.timestamp
-        < last_processed_candle_timestamp
+        <= last_processed_candle_timestamp
     ):
-
-        log(
-            "Ignoring out-of-order candle | "
-            f"{candle.timestamp}"
-        )
 
         return
 
@@ -1381,40 +1155,17 @@ async def process_closed_candle(
         candle.timestamp
     )
 
-    # --------------------------------------------------------
-    # Update candle history exactly once.
-    # --------------------------------------------------------
+    added = append_closed_candle(candle)
 
-    # Extra protection against accidental duplicate
-    # timestamps from the API.
-    if candles:
-
-        if candles[-1].timestamp == candle.timestamp:
-            candles[-1] = candle
-
-        else:
-            candles.append(candle)
-
-    else:
-        candles.append(candle)
-
-    # Keep memory bounded.
-    if len(candles) > MAX_CANDLE_BUFFER:
-
-        del candles[
-            :-MAX_CANDLE_BUFFER
-        ]
-
-    # --------------------------------------------------------
-    # Log closed candle.
-    # --------------------------------------------------------
+    if not added:
+        return
 
     candle_time = datetime.fromtimestamp(
         candle.timestamp
     ).strftime("%H:%M:%S")
 
     log(
-        "CANDLE CLOSED | "
+        f"CANDLE CLOSED | "
         f"{candle_time} | "
         f"O={candle.open:.6f} "
         f"H={candle.high:.6f} "
@@ -1422,36 +1173,22 @@ async def process_closed_candle(
         f"C={candle.close:.6f}"
     )
 
-    # --------------------------------------------------------
-    # Unlock a previous zone if price has exited it.
-    #
-    # We use the CLOSED candle close here. This keeps zone
-    # locking based on closed-candle data and avoids using
-    # live prices to alter strategy state.
-    # --------------------------------------------------------
+    log(
+        f"History: "
+        f"{len(candles)}/{LOOKBACK_WINDOW}"
+    )
 
+    # Release locks only after price has actually exited.
     unlock_zones_if_price_exited(
         candle.close
     )
 
-    # --------------------------------------------------------
-    # Build history.
-    # --------------------------------------------------------
-
     if len(candles) < LOOKBACK_WINDOW:
-
-        log(
-            "Building history | "
-            f"{len(candles)}/"
-            f"{LOOKBACK_WINDOW}"
-        )
 
         return
 
     # --------------------------------------------------------
-    # Evaluate C0.
-    #
-    # C0 is ALWAYS the candle that just closed.
+    # Evaluate only AFTER C0 is completely closed.
     # --------------------------------------------------------
 
     signal_data = evaluate_signal(
@@ -1461,232 +1198,297 @@ async def process_closed_candle(
     if not signal_data:
         return
 
-    zone: Zone = signal_data["zone"]
+    zone = signal_data["zone"]
 
     # --------------------------------------------------------
-    # Stable zone lock check.
+    # Stable one-trade-per-zone lock.
     # --------------------------------------------------------
 
-    if zone_is_locked(zone):
+    if (
+        ONE_TRADE_PER_ZONE
+        and
+        zone_lock_matches(
+            zone.zone_type,
+            zone.zone_low,
+            zone.zone_high
+        )
+    ):
 
         log(
             "SIGNAL BLOCKED | "
-            f"{zone.zone_type.upper()} zone "
-            "already traded during current touch."
+            "same S/R zone is already locked."
         )
 
         return
 
-    # --------------------------------------------------------
-    # Lock BEFORE scheduling the trade.
+    # Lock before scheduling the trade.
+    lock_zone(zone)
+
+    # Do NOT await here.
     #
-    # This prevents another candle arriving immediately
-    # afterwards from creating another order.
-    # --------------------------------------------------------
-
-    lock_zone(
-        zone,
-        candle.timestamp
-    )
-
-    # --------------------------------------------------------
-    # DO NOT await execute_trade().
-    #
-    # The live candle stream must continue running.
-    # --------------------------------------------------------
-
-    create_trade_task(
-        signal_data
-    )
+    # This prevents order submission from blocking the
+    # live market stream.
+    launch_trade(signal_data)
 
 
 # ============================================================
-# INITIAL HISTORICAL DATA
+# INITIAL HISTORY
 # ============================================================
 
-async def load_initial_history() -> None:
+async def load_initial_history():
 
     global candles
-    global last_processed_candle_timestamp
 
     log(
-        f"Loading approximately "
-        f"{HISTORY_HOURS}h of closed "
-        f"{TIMEFRAME}s candles..."
+        f"Loading initial "
+        f"{LOOKBACK_WINDOW}-candle "
+        f"{TIMEFRAME}s history..."
+    )
+
+    # The library explicitly supports custom-period candles.
+    #
+    # custom_period = 15 seconds
+    # lookback_period = number of seconds to inspect
+    #
+    # We request substantially more than the minimum because
+    # pivot detection needs candles on both sides.
+
+    lookback_seconds = (
+        (LOOKBACK_WINDOW + 20)
+        * TIMEFRAME
     )
 
     try:
 
-        generator = client.get_candles_live(
+        raw_history = await client.compile_candles(
             ASSET,
             TIMEFRAME,
-            hours=HISTORY_HOURS,
-            max_rows=max(
-                LOOKBACK_WINDOW + 20,
-                100
-            )
+            lookback_seconds
         )
-
-        closed_candles, forming_candle = (
-            await anext(generator)
-        )
-
-        normalized: list[Candle] = []
-
-        for raw in closed_candles:
-
-            candle = normalize_candle(raw)
-
-            if candle is None:
-                continue
-
-            normalized.append(candle)
-
-        # ----------------------------------------------------
-        # Sort and deduplicate.
-        # ----------------------------------------------------
-
-        normalized.sort(
-            key=lambda candle:
-            candle.timestamp
-        )
-
-        deduped: list[Candle] = []
-
-        seen_timestamps = set()
-
-        for candle in normalized:
-
-            if candle.timestamp in seen_timestamps:
-                continue
-
-            seen_timestamps.add(
-                candle.timestamp
-            )
-
-            deduped.append(candle)
-
-        candles = deduped[
-            -MAX_CANDLE_BUFFER:
-        :]
-
-        if candles:
-
-            last_processed_candle_timestamp = (
-                candles[-1].timestamp
-            )
-
-        log(
-            f"Loaded {len(candles)} CLOSED candles."
-        )
-
-        if forming_candle is not None:
-
-            log(
-                "Current forming candle was "
-                "intentionally NOT added to strategy history."
-            )
-
-        if len(candles) < LOOKBACK_WINDOW:
-
-            raise RuntimeError(
-                "Insufficient historical candles. "
-                f"Required {LOOKBACK_WINDOW}, "
-                f"received {len(candles)}."
-            )
 
     except Exception as exc:
 
         log(
-            "Historical data error | "
+            f"compile_candles() failed | "
             f"{type(exc).__name__}: {exc}"
         )
 
         raise
 
+    normalized = []
 
-# ============================================================
-# LIVE 15-SECOND STREAM
-# ============================================================
+    for raw in raw_history:
 
-async def handle_stream() -> None:
-
-    log(
-        f"Subscribing to "
-        f"{ASSET} "
-        f"with TIME-ALIGNED "
-        f"{TIMEFRAME}s candles..."
-    )
-
-    # --------------------------------------------------------
-    # BinaryOptionsTools-v2 provides:
-    #
-    # subscribe_symbol_time_aligned(
-    #     asset,
-    #     timedelta(seconds=15)
-    # )
-    #
-    # TimeAligned candles are aligned to clock boundaries.
-    # --------------------------------------------------------
-
-    stream = await (
-        client.subscribe_symbol_time_aligned(
-            ASSET,
-            timedelta(
-                seconds=TIMEFRAME
-            )
-        )
-    )
-
-    log(
-        "15-second time-aligned subscription active."
-    )
-
-    async for raw_candle in stream:
-
-        if not running:
-            break
-
-        candle = normalize_candle(
-            raw_candle
-        )
+        candle = normalize_candle(raw)
 
         if candle is None:
-
-            # Some library versions may produce a raw
-            # price object rather than a candle object.
-            # We intentionally do NOT evaluate it as C0.
             continue
 
-        # ----------------------------------------------------
-        # Every item from this subscription is treated as a
-        # completed time-aligned candle.
-        #
-        # Never evaluate an unclosed candle.
-        # ----------------------------------------------------
+        normalized.append(candle)
 
-        await process_closed_candle(
-            candle
-        )
+    normalized.sort(
+        key=lambda c: c.timestamp
+    )
 
-    log("Live candle stream ended.")
+    # Deduplicate.
+    unique = {}
 
+    for candle in normalized:
 
-# ============================================================
-# ACCOUNT
-# ============================================================
+        unique[candle.timestamp] = candle
 
-async def show_account() -> None:
+    normalized = list(
+        unique.values()
+    )
+
+    normalized.sort(
+        key=lambda c: c.timestamp
+    )
+
+    # IMPORTANT:
+    #
+    # We do NOT intentionally feed the most recent possibly
+    # forming candle into the strategy.
+    #
+    # Determine the current 15s boundary using server time if
+    # possible.
+
+    server_now = None
 
     try:
 
-        is_demo = client.is_demo()
+        server_now = await client.get_server_time()
+
+    except Exception:
+
+        try:
+            server_now = int(time.time())
+        except Exception:
+            server_now = None
+
+    if server_now is not None:
+
+        current_bucket = (
+            int(server_now)
+            // TIMEFRAME
+        ) * TIMEFRAME
+
+        normalized = [
+            c
+            for c in normalized
+            if c.timestamp < current_bucket
+        ]
+
+    if len(normalized) > LOOKBACK_WINDOW + 20:
+
+        normalized = normalized[
+            -(LOOKBACK_WINDOW + 20):
+        ]
+
+    candles = normalized
+
+    if candles:
+
+        last_processed_candle_timestamp = (
+            candles[-1].timestamp
+        )
+
+    log(
+        f"Initial closed candles loaded: "
+        f"{len(candles)}"
+    )
+
+    if candles:
+
+        latest = candles[-1]
+
+        log(
+            f"Latest closed candle: "
+            f"{datetime.fromtimestamp(latest.timestamp).strftime('%H:%M:%S')} "
+            f"C={latest.close:.6f}"
+        )
+
+    if len(candles) < LOOKBACK_WINDOW:
+
+        raise RuntimeError(
+            f"Only {len(candles)} closed candles "
+            f"were loaded; "
+            f"{LOOKBACK_WINDOW} are required."
+        )
+
+
+# ============================================================
+# ASSET VALIDATION
+# ============================================================
+
+async def validate_asset():
+
+    log(
+        f"Checking asset: {ASSET}"
+    )
+
+    assets = await client.active_assets()
+
+    # Depending on the version, active_assets may return a
+    # decoded list or a JSON string.
+    if isinstance(assets, str):
+
+        import json
+
+        assets = json.loads(assets)
+
+    if not isinstance(assets, list):
+
+        raise RuntimeError(
+            "Unexpected active_assets() response."
+        )
+
+    matches = [
+        asset
+        for asset in assets
+        if asset.get("symbol") == ASSET
+    ]
+
+    if not matches:
+
+        raise RuntimeError(
+            f"{ASSET} was not found in active assets."
+        )
+
+    asset = matches[0]
+
+    is_active = asset.get(
+        "is_active",
+        True
+    )
+
+    if not is_active:
+
+        raise RuntimeError(
+            f"{ASSET} is not active."
+        )
+
+    log(
+        f"Asset verified | "
+        f"{ASSET} | "
+        f"OTC={asset.get('is_otc')} | "
+        f"active={is_active} | "
+        f"payout={asset.get('payout')}%"
+    )
+
+    allowed = asset.get(
+        "allowed_candles",
+        []
+    )
+
+    if TIMEFRAME not in allowed:
+
+        log(
+            f"INFO | Native {TIMEFRAME}s candle "
+            f"is NOT advertised by asset metadata."
+        )
+
+        log(
+            f"INFO | Allowed native candle periods: "
+            f"{allowed}"
+        )
+
+        log(
+            f"INFO | This is NOT fatal. "
+            f"We will construct {TIMEFRAME}s candles "
+            f"using BinaryOptionsToolsV2 custom "
+            f"candle/timed-stream functionality."
+        )
+
+    else:
+
+        log(
+            f"Native {TIMEFRAME}s candle "
+            f"is advertised."
+        )
+
+    return asset
+
+
+# ============================================================
+# ACCOUNT INFORMATION
+# ============================================================
+
+async def show_account():
+
+    try:
+
+        demo_result = client.is_demo()
+
+        if asyncio.iscoroutine(demo_result):
+
+            demo_result = await demo_result
 
         log(
             "Account type: "
             + (
                 "DEMO"
-                if is_demo
+                if demo_result
                 else "REAL"
             )
         )
@@ -1694,8 +1496,8 @@ async def show_account() -> None:
     except Exception as exc:
 
         log(
-            "Could not determine account type | "
-            f"{type(exc).__name__}: {exc}"
+            f"Could not determine account type: "
+            f"{exc}"
         )
 
     try:
@@ -1710,8 +1512,114 @@ async def show_account() -> None:
     except Exception as exc:
 
         log(
-            "Could not retrieve balance | "
+            f"Could not retrieve balance: "
             f"{type(exc).__name__}: {exc}"
+        )
+
+
+# ============================================================
+# LIVE 15-SECOND STREAM
+# ============================================================
+
+async def handle_live_stream():
+
+    log("")
+    log("=" * 80)
+    log(
+        f"SUBSCRIBING TO {ASSET} "
+        f"15-SECOND LIVE STREAM"
+    )
+    log("=" * 80)
+
+    log(
+        "Using time-aligned 15-second candles."
+    )
+
+    log(
+        "Native asset candle support is NOT "
+        "required for this mode."
+    )
+
+    stream = None
+
+    try:
+
+        # BinaryOptionsToolsV2 provides this specifically for
+        # timed, clock-aligned candle windows.
+
+        stream = await client.subscribe_symbol_time_aligned(
+            ASSET,
+            timedelta(seconds=TIMEFRAME)
+        )
+
+    except AttributeError:
+
+        log(
+            "subscribe_symbol_time_aligned() "
+            "not available."
+        )
+
+        log(
+            "Falling back to subscribe_symbol_timed()."
+        )
+
+        stream = await client.subscribe_symbol_timed(
+            ASSET,
+            timedelta(seconds=TIMEFRAME)
+        )
+
+    log(
+        "15-second live subscription established."
+    )
+
+    async for raw in stream:
+
+        if not running:
+            break
+
+        candle = normalize_candle(raw)
+
+        if candle is None:
+
+            # Some library versions can expose a price-only
+            # update through a timed subscription. Ignore those
+            # here because this strategy only evaluates CLOSED
+            # OHLC candles.
+            continue
+
+        # ----------------------------------------------------
+        # Closed-candle safety
+        # ----------------------------------------------------
+        #
+        # We do not blindly process every object returned.
+        #
+        # A candle whose bucket is still current is ignored.
+        #
+
+        try:
+
+            server_time = await client.get_server_time()
+
+        except Exception:
+
+            server_time = int(time.time())
+
+        current_bucket = (
+            server_time // TIMEFRAME
+        ) * TIMEFRAME
+
+        candle_end = (
+            candle.timestamp
+            + TIMEFRAME
+        )
+
+        if candle_end > current_bucket:
+
+            # Still forming.
+            continue
+
+        await process_closed_candle(
+            candle
         )
 
 
@@ -1725,293 +1633,54 @@ async def start_client(
 
     global client
 
+    if not SSID:
+
+        raise RuntimeError(
+            "POCKET_OPTION_SSID is not configured."
+        )
+
     log(
         "Creating PocketOptionAsync client..."
     )
 
     client = PocketOptionAsync(
-        SSID
+        ssid=SSID
     )
 
     log(
         "Client created."
     )
 
-    # Give the WebSocket/client time to initialize.
+    # The repo examples/documentation use a short initialization
+    # wait before account/market operations.
+
     await asyncio.sleep(5)
 
-    # Wait for asset information if available.
     try:
 
         await client.wait_for_assets(
-            timeout_secs=30.0
+            timeout=60
         )
-
-        log(
-            "Asset list loaded."
-        )
-
-    except TypeError:
-
-        # Some versions use timeout rather than
-        # timeout_secs.
-        try:
-
-            await client.wait_for_assets(
-                timeout=30.0
-            )
-
-            log(
-                "Asset list loaded."
-            )
-
-        except Exception as exc:
-
-            log(
-                "Asset wait failed | "
-                f"{type(exc).__name__}: {exc}"
-            )
 
     except Exception as exc:
 
         log(
-            "Asset wait failed | "
+            f"Asset wait returned: "
             f"{type(exc).__name__}: {exc}"
         )
-
-    return client
-
-
-# ============================================================
-# ASSET VALIDATION
-# ============================================================
-
-async def validate_asset() -> None:
-
-    try:
-
-        assets = await client.active_assets()
-
-        matches = [
-            asset
-            for asset in assets
-            if asset.get("symbol") == ASSET
-        ]
-
-        if not matches:
-
-            raise RuntimeError(
-                f"{ASSET} was not found in active assets."
-            )
-
-        asset = matches[0]
-
-        log(
-            f"Asset verified | "
-            f"{asset.get('symbol')} | "
-            f"OTC={asset.get('is_otc')} | "
-            f"active={asset.get('is_active')} | "
-            f"payout={asset.get('payout')}%"
-        )
-
-        allowed = asset.get(
-            "allowed_candles",
-            []
-        )
-
-        allowed_times = []
-
-        for item in allowed:
-
-            if isinstance(item, dict):
-                value = item.get("time")
-
-                if value is not None:
-                    allowed_times.append(
-                        int(value)
-                    )
-
-        if (
-            allowed_times
-            and
-            TIMEFRAME not in allowed_times
-        ):
-
-            raise RuntimeError(
-                f"{ASSET} does not advertise "
-                f"{TIMEFRAME}s candles. "
-                f"Allowed: {allowed_times}"
-            )
-
-    except Exception as exc:
-
-        log(
-            "Asset validation failed | "
-            f"{type(exc).__name__}: {exc}"
-        )
-
-        raise
-
-
-# ============================================================
-# CLEANUP
-# ============================================================
-
-async def cancel_stream_task() -> None:
-
-    global stream_task
-
-    if stream_task is None:
-        return
-
-    if stream_task.done():
-        return
 
     log(
-        "Cancelling live stream task..."
+        "Asset list loaded."
     )
-
-    stream_task.cancel()
-
-    try:
-
-        await stream_task
-
-    except asyncio.CancelledError:
-        pass
-
-    except Exception as exc:
-
-        log(
-            "Stream task shutdown error | "
-            f"{type(exc).__name__}: {exc}"
-        )
-
-
-async def cleanup_trade_tasks() -> None:
-
-    if not trade_tasks:
-        return
-
-    log(
-        f"Cleaning up "
-        f"{len(trade_tasks)} trade task(s)..."
-    )
-
-    tasks = list(
-        trade_tasks
-    )
-
-    # Give currently submitted trades a moment to finish
-    # their API call. Do NOT cancel immediately.
-    try:
-
-        await asyncio.wait(
-            tasks,
-            timeout=5
-        )
-
-    except Exception:
-        pass
-
-    # Cancel anything still running.
-    for task in tasks:
-
-        if not task.done():
-            task.cancel()
-
-    if tasks:
-
-        await asyncio.gather(
-            *tasks,
-            return_exceptions=True
-        )
-
-    trade_tasks.clear()
-
-
-async def shutdown_client() -> None:
-
-    global client
-
-    if client is None:
-        return
-
-    log(
-        "Shutting down Pocket Option client..."
-    )
-
-    try:
-
-        shutdown_method = getattr(
-            client,
-            "shutdown",
-            None
-        )
-
-        if shutdown_method is not None:
-
-            result = shutdown_method()
-
-            if asyncio.iscoroutine(result):
-
-                await result
-
-            log(
-                "Pocket Option client shutdown."
-            )
-
-            return
-
-    except Exception as exc:
-
-        log(
-            "Client shutdown() failed | "
-            f"{type(exc).__name__}: {exc}"
-        )
-
-    # Fallback to disconnect if available.
-    try:
-
-        disconnect_method = getattr(
-            client,
-            "disconnect",
-            None
-        )
-
-        if disconnect_method is not None:
-
-            result = disconnect_method()
-
-            if asyncio.iscoroutine(result):
-                await result
-
-            log(
-                "Pocket Option client disconnected."
-            )
-
-    except Exception as exc:
-
-        log(
-            "Client disconnect failed | "
-            f"{type(exc).__name__}: {exc}"
-        )
 
 
 # ============================================================
-# MAIN
+# BOT MAIN
 # ============================================================
 
-async def main() -> None:
-
-    global shutdown_event
-    global stream_task
-
-    shutdown_event = asyncio.Event()
+async def main():
 
     print_header()
-
-    validate_configuration()
 
     PocketOptionAsync = import_library()
 
@@ -2024,135 +1693,87 @@ async def main() -> None:
     await validate_asset()
 
     # --------------------------------------------------------
-    # Load historical CLOSED candles.
+    # IMPORTANT:
     #
-    # The current forming candle is intentionally discarded.
+    # This is where the old bot would have failed because
+    # AUDUSD_otc did not advertise 15 seconds.
+    #
+    # We deliberately allow it.
     # --------------------------------------------------------
 
     await load_initial_history()
 
     log("")
-    log("=" * 80)
-    log("STRATEGY READY")
-    log("=" * 80)
-
     log(
-        f"Asset       : {ASSET}"
+        f"Starting {TIMEFRAME}s "
+        f"{ASSET} reversal strategy..."
     )
 
     log(
-        f"Timeframe   : {TIMEFRAME}s"
+        "Strategy is now waiting for "
+        "the next CLOSED 15s candle."
     )
 
-    log(
-        f"Expiry      : {EXPIRY_SECONDS}s"
-    )
+    await handle_live_stream()
 
-    log(
-        f"Lookback    : {LOOKBACK_WINDOW}"
-    )
 
-    log(
-        "C0          : most recently CLOSED candle"
-    )
+# ============================================================
+# CLEANUP
+# ============================================================
 
-    log(
-        "Entry       : immediately after C0 closes"
-    )
+async def shutdown_client():
 
-    log(
-        "BUY         : Dragonfly Doji / Hammer at support"
-    )
+    global client
 
-    log(
-        "SELL        : Gravestone Doji / Shooting Star at resistance"
-    )
+    # Cancel background trade tasks first.
+    if trade_tasks:
 
-    log("=" * 80)
+        log(
+            f"Cancelling "
+            f"{len(trade_tasks)} background "
+            f"trade task(s)..."
+        )
 
-    # --------------------------------------------------------
-    # Start live stream.
-    # --------------------------------------------------------
+        for task in list(trade_tasks):
 
-    stream_task = asyncio.create_task(
-        handle_stream()
-    )
+            task.cancel()
 
-    shutdown_wait_task = asyncio.create_task(
-        shutdown_event.wait()
-    )
+        await asyncio.gather(
+            *trade_tasks,
+            return_exceptions=True
+        )
+
+        trade_tasks.clear()
+
+    if client is None:
+        return
 
     try:
 
-        done, pending = await asyncio.wait(
-            [
-                stream_task,
-                shutdown_wait_task
-            ],
-            return_when=asyncio.FIRST_COMPLETED
+        shutdown = getattr(
+            client,
+            "shutdown",
+            None
         )
 
-        # ----------------------------------------------------
-        # If stream stopped unexpectedly while bot is still
-        # running, surface its exception.
-        # ----------------------------------------------------
+        if shutdown:
 
-        if stream_task in done:
+            result = shutdown()
 
-            try:
-                await stream_task
+            if asyncio.iscoroutine(result):
 
-            except asyncio.CancelledError:
-                pass
-
-            except Exception as exc:
-
-                log(
-                    "Live stream stopped with error | "
-                    f"{type(exc).__name__}: {exc}"
-                )
-
-                raise
-
-        # ----------------------------------------------------
-        # If shutdown was requested, terminate stream.
-        # ----------------------------------------------------
-
-        if shutdown_wait_task in done:
+                await result
 
             log(
-                "Shutdown event received."
+                "Pocket Option client shutdown successfully."
             )
 
-            if (
-                stream_task is not None
-                and
-                not stream_task.done()
-            ):
+    except Exception as exc:
 
-                stream_task.cancel()
-
-                try:
-                    await stream_task
-
-                except asyncio.CancelledError:
-                    pass
-
-    finally:
-
-        shutdown_wait_task.cancel()
-
-        try:
-            await shutdown_wait_task
-
-        except asyncio.CancelledError:
-            pass
-
-        await cancel_stream_task()
-
-        await cleanup_trade_tasks()
-
-        await shutdown_client()
+        log(
+            f"Shutdown error: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
 
 # ============================================================
@@ -2160,8 +1781,6 @@ async def main() -> None:
 # ============================================================
 
 if __name__ == "__main__":
-
-    install_signal_handlers()
 
     try:
 
@@ -2171,9 +1790,7 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
 
-        request_shutdown(
-            "KeyboardInterrupt"
-        )
+        pass
 
     except Exception as exc:
 
@@ -2181,21 +1798,30 @@ if __name__ == "__main__":
         print("=" * 80)
         print("BOT STOPPED")
         print("=" * 80)
+
         print(
             f"Error type : "
             f"{type(exc).__name__}"
         )
+
         print(
             f"Error      : "
             f"{exc}"
         )
+
         print("=" * 80)
 
         sys.exit(1)
 
     finally:
 
+        # asyncio.run() has already closed the event loop,
+        # so cleanup must be handled inside the running loop.
+        #
+        # If the main coroutine exits normally, there is no
+        # active loop here. This final block is intentionally
+        # lightweight.
+
         print(
-            "Bot shutdown complete.",
-            flush=True
+            "Bot shutdown complete."
         )

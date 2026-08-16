@@ -1,7 +1,9 @@
 import asyncio
 import os
 import signal
-from datetime import timedelta, datetime, timezone
+import time
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation
 
 from dotenv import load_dotenv
 
@@ -19,24 +21,25 @@ SSID = os.getenv("POCKET_OPTION_SSID")
 ASSET = "EURGBP_otc"
 TIMEFRAME_SECONDS = 15
 
-TRADE_AMOUNT = 2500.0
-EXPIRY_SECONDS = 15
-
-LOOKBACK_WINDOW = 50
+# How long this diagnostic test should run.
+# Set to 300 for 5 minutes, 600 for 10 minutes, etc.
+TEST_DURATION_SECONDS = int(
+    os.getenv("TEST_DURATION_SECONDS", "300")
+)
 
 
 # ============================================================
 # GLOBAL STATE
 # ============================================================
 
-shutdown_event = asyncio.Event()
+shutdown_requested = False
 
 
 # ============================================================
 # LOGGING
 # ============================================================
 
-def log(message: str):
+def log(message):
     now = datetime.now().strftime("%H:%M:%S")
     print(f"[{now}] {message}", flush=True)
 
@@ -45,435 +48,558 @@ def log(message: str):
 # SHUTDOWN
 # ============================================================
 
-def request_shutdown():
-    if not shutdown_event.is_set():
-        log("Shutdown requested.")
-        shutdown_event.set()
+def request_shutdown(signum=None, frame=None):
+    global shutdown_requested
+
+    if not shutdown_requested:
+        shutdown_requested = True
+
+        if signum is not None:
+            log(f"Shutdown signal received: {signum}")
+
+        log("Stopping candle alignment test...")
 
 
-def install_signal_handlers():
+# ============================================================
+# NUMBER CONVERSION
+# ============================================================
+
+def to_float(value):
+    if value is None:
+        return None
+
     try:
-        loop = asyncio.get_running_loop()
-
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, request_shutdown)
-            except (NotImplementedError, RuntimeError):
-                pass
-
-    except Exception as e:
-        log(f"Signal handler setup warning: {e}")
+        return float(value)
+    except (ValueError, TypeError):
+        return None
 
 
 # ============================================================
-# CANDLE NORMALIZATION
+# CLOCK ALIGNMENT
 # ============================================================
 
-def normalize_candle(raw):
+def aligned_bucket_timestamp(timestamp, interval_seconds):
     """
-    BinaryOptionsToolsV2 returns candle dictionaries.
+    Convert any Unix timestamp into the beginning of its
+    wall-clock interval.
 
-    This function normalizes the common field names into:
+    For 15 seconds:
 
-        {
-            timestamp,
-            open,
-            high,
-            low,
-            close
+        xx:xx:00 -> xx:xx:00
+        xx:xx:01 -> xx:xx:00
+        ...
+        xx:xx:14 -> xx:xx:00
+
+        xx:xx:15 -> xx:xx:15
+        ...
+        xx:xx:29 -> xx:xx:15
+
+        xx:xx:30 -> xx:xx:30
+        ...
+        xx:xx:44 -> xx:xx:30
+
+        xx:xx:45 -> xx:xx:45
+        ...
+        xx:xx:59 -> xx:xx:45
+    """
+
+    return timestamp - (timestamp % interval_seconds)
+
+
+def timestamp_to_datetime(timestamp):
+    return datetime.fromtimestamp(
+        timestamp,
+        tz=timezone.utc
+    )
+
+
+def format_timestamp(timestamp):
+    dt = timestamp_to_datetime(timestamp)
+
+    return dt.strftime("%H:%M:%S")
+
+
+# ============================================================
+# CANDLE OBJECT
+# ============================================================
+
+class AlignedCandle:
+
+    def __init__(self, timestamp, price_data):
+        self.timestamp = timestamp
+
+        self.open = price_data
+        self.high = price_data
+        self.low = price_data
+        self.close = price_data
+
+    def update(self, price):
+        if price > self.high:
+            self.high = price
+
+        if price < self.low:
+            self.low = price
+
+        self.close = price
+
+    def as_dict(self):
+        return {
+            "timestamp": self.timestamp,
+            "open": self.open,
+            "high": self.high,
+            "low": self.low,
+            "close": self.close,
         }
 
-    We intentionally keep this defensive because the exact
-    candle dictionary representation can vary between streams.
-    """
-
-    if raw is None:
-        return None
-
-    if not isinstance(raw, dict):
-        log(f"Unexpected candle type: {type(raw).__name__}")
-        return None
-
-    timestamp = (
-        raw.get("timestamp")
-        or raw.get("time")
-        or raw.get("at")
-        or raw.get("from")
-    )
-
-    open_price = (
-        raw.get("open")
-        or raw.get("o")
-    )
-
-    high_price = (
-        raw.get("high")
-        or raw.get("h")
-    )
-
-    low_price = (
-        raw.get("low")
-        or raw.get("l")
-    )
-
-    close_price = (
-        raw.get("close")
-        or raw.get("c")
-    )
-
-    try:
-        if timestamp is not None:
-            timestamp = float(timestamp)
-
-        if open_price is not None:
-            open_price = float(open_price)
-
-        if high_price is not None:
-            high_price = float(high_price)
-
-        if low_price is not None:
-            low_price = float(low_price)
-
-        if close_price is not None:
-            close_price = float(close_price)
-
-    except (TypeError, ValueError):
-        return None
-
-    if any(
-        value is None
-        for value in (
-            timestamp,
-            open_price,
-            high_price,
-            low_price,
-            close_price,
-        )
-    ):
-        return None
-
-    return {
-        "timestamp": timestamp,
-        "open": open_price,
-        "high": high_price,
-        "low": low_price,
-        "close": close_price,
-    }
-
 
 # ============================================================
-# CANDLE DISPLAY
+# PRINT CANDLE
 # ============================================================
 
-def candle_time(timestamp):
-    try:
-        return datetime.fromtimestamp(
-            timestamp,
-            tz=timezone.utc
-        ).strftime("%Y-%m-%d %H:%M:%S UTC")
-    except Exception:
-        return str(timestamp)
+def print_closed_candle(candle):
+    start = candle.timestamp
+    end = start + TIMEFRAME_SECONDS
 
+    change = candle.close - candle.open
 
-def display_candle(candle, number=None):
-
-    o = candle["open"]
-    h = candle["high"]
-    l = candle["low"]
-    c = candle["close"]
-
-    change = c - o
-
-    if c > o:
+    if candle.close > candle.open:
         direction = "BULLISH"
-    elif c < o:
+    elif candle.close < candle.open:
         direction = "BEARISH"
     else:
         direction = "DOJI"
 
-    label = f"CANDLE #{number}" if number else "CANDLE"
+    range_value = candle.high - candle.low
 
     print()
-    print("=" * 80)
-    print(f"{label} | {ASSET} | {TIMEFRAME_SECONDS}s")
-    print("=" * 80)
+    print("=" * 78)
+    print("CLOSED ALIGNED 15-SECOND CANDLE")
+    print("=" * 78)
 
-    print(f"Time      : {candle_time(candle['timestamp'])}")
-    print(f"Open      : {o:.6f}")
-    print(f"High      : {h:.6f}")
-    print(f"Low       : {l:.6f}")
-    print(f"Close     : {c:.6f}")
-    print(f"Direction : {direction}")
-    print(f"Change    : {change:+.6f}")
+    print(
+        f"Interval : "
+        f"{format_timestamp(start)} → {format_timestamp(end)}"
+    )
 
-    print("=" * 80)
+    print(
+        f"O: {candle.open:.6f}    "
+        f"H: {candle.high:.6f}    "
+        f"L: {candle.low:.6f}    "
+        f"C: {candle.close:.6f}"
+    )
+
+    print(
+        f"Direction: {direction:<8} "
+        f"Change: {change:+.6f}    "
+        f"Range: {range_value:.6f}"
+    )
+
+    print(
+        f"Clock alignment: "
+        f"{format_timestamp(start)} "
+        f"(second={start % 60:02d})"
+    )
+
+    print("=" * 78)
+    print()
 
 
 # ============================================================
-# MAIN STREAM
+# MAIN STREAM TEST
 # ============================================================
 
-async def run():
+async def run_test(client):
 
-    if not SSID:
-        raise RuntimeError(
-            "POCKET_OPTION_SSID is missing from Railway environment variables."
+    global shutdown_requested
+
+    log("=" * 78)
+    log("EURGBP OTC — ALIGNED 15 SECOND CANDLE TEST")
+    log("=" * 78)
+
+    log(f"Asset      : {ASSET}")
+    log(f"Timeframe  : {TIMEFRAME_SECONDS}s")
+    log(f"Test time  : {TEST_DURATION_SECONDS}s")
+    log("")
+    log("IMPORTANT:")
+    log("The subscription's initial timestamp is NOT used as")
+    log("the candle clock anchor.")
+    log("")
+    log("Required candle boundaries:")
+    log("00 → 15 → 30 → 45 → 00")
+    log("=" * 78)
+
+    # --------------------------------------------------------
+    # Subscribe
+    # --------------------------------------------------------
+
+    log("Subscribing to timed EURGBP_otc stream...")
+
+    subscription = await client.subscribe_symbol_timed(
+        ASSET,
+        timedelta(seconds=TIMEFRAME_SECONDS)
+    )
+
+    log("Subscription established.")
+    log("Waiting for live market data...")
+    log("")
+
+    # --------------------------------------------------------
+    # Candle state
+    # --------------------------------------------------------
+
+    current_candle = None
+
+    first_stream_timestamp = None
+    aligned_start_timestamp = None
+
+    stream_start = time.monotonic()
+
+    received_updates = 0
+    completed_candles = 0
+
+    # --------------------------------------------------------
+    # Process stream
+    # --------------------------------------------------------
+
+    async for raw_candle in subscription:
+
+        if shutdown_requested:
+            break
+
+        if time.monotonic() - stream_start >= TEST_DURATION_SECONDS:
+            log("Test duration reached.")
+            break
+
+        received_updates += 1
+
+        # ----------------------------------------------------
+        # Extract timestamp
+        # ----------------------------------------------------
+
+        timestamp = (
+            raw_candle.get("timestamp")
+            or raw_candle.get("time")
         )
 
-    print("=" * 80)
-    print("POCKET OPTION 15s STREAM TEST")
-    print("=" * 80)
-
-    print(f"Asset          : {ASSET}")
-    print(f"Requested TF   : {TIMEFRAME_SECONDS}s")
-    print(f"Trade amount   : ${TRADE_AMOUNT:,.2f}")
-    print(f"Expiry         : {EXPIRY_SECONDS}s")
-    print(f"History target : {LOOKBACK_WINDOW} candles")
-    print("=" * 80)
-
-    install_signal_handlers()
-
-    api = None
-
-    try:
-
-        # --------------------------------------------------------
-        # CREATE CLIENT
-        # --------------------------------------------------------
-
-        log("Creating PocketOptionAsync client...")
-
-        api = PocketOptionAsync(SSID)
-
-        log("Client created.")
-
-        # --------------------------------------------------------
-        # WAIT FOR INITIALIZATION
-        # --------------------------------------------------------
-
-        log("Waiting for Pocket Option connection initialization...")
-
-        await asyncio.sleep(5)
-
-        # --------------------------------------------------------
-        # ACCOUNT
-        # --------------------------------------------------------
+        if timestamp is None:
+            log("WARNING: stream update has no timestamp.")
+            continue
 
         try:
-            balance = await api.get_balance()
-
-            log(f"Balance: ${float(balance):,.2f}")
-
-        except Exception as e:
-            log(f"Balance check warning: {type(e).__name__}: {e}")
-
-        # --------------------------------------------------------
-        # ASSET CHECK
-        # --------------------------------------------------------
-
-        log(f"Checking asset: {ASSET}")
-
-        try:
-
-            assets = await api.get_assets()
-
-            matching = []
-
-            if isinstance(assets, list):
-
-                for asset in assets:
-
-                    if not isinstance(asset, dict):
-                        continue
-
-                    symbol = asset.get("symbol")
-
-                    if symbol == ASSET:
-                        matching.append(asset)
-
-            if matching:
-
-                asset = matching[0]
-
-                log(
-                    f"Asset verified | "
-                    f"{asset.get('symbol')} | "
-                    f"OTC={asset.get('is_otc')} | "
-                    f"active={asset.get('is_active')} | "
-                    f"payout={asset.get('payout')}%"
-                )
-
-                log(
-                    "Native candle metadata: "
-                    f"{asset.get('allowed_candles')}"
-                )
-
-            else:
-
-                log(
-                    f"WARNING: {ASSET} was not found in the returned "
-                    "asset list."
-                )
-
-        except Exception as e:
-
+            timestamp = int(timestamp)
+        except (ValueError, TypeError):
             log(
-                f"Asset check warning | "
-                f"{type(e).__name__}: {e}"
+                f"WARNING: invalid timestamp: {timestamp}"
+            )
+            continue
+
+        # ----------------------------------------------------
+        # Extract price
+        # ----------------------------------------------------
+
+        close_price = to_float(
+            raw_candle.get("close")
+        )
+
+        if close_price is None:
+
+            # Some stream versions may provide last price
+            close_price = to_float(
+                raw_candle.get("price")
             )
 
-        # --------------------------------------------------------
-        # IMPORTANT:
-        #
-        # DO NOT CHECK allowed_candles FOR 15s.
-        #
-        # The library provides a timed subscription which combines
-        # candle data into the requested time range.
-        # --------------------------------------------------------
+        if close_price is None:
+            log(
+                "WARNING: stream update contains no usable price."
+            )
+            continue
 
-        print()
-        print("=" * 80)
-        print("SUBSCRIBING TO LIBRARY TIMED 15s STREAM")
-        print("=" * 80)
+        # ----------------------------------------------------
+        # FIRST STREAM UPDATE
+        # ----------------------------------------------------
+
+        if first_stream_timestamp is None:
+
+            first_stream_timestamp = timestamp
+
+            aligned_start_timestamp = (
+                aligned_bucket_timestamp(
+                    timestamp,
+                    TIMEFRAME_SECONDS
+                )
+            )
+
+            log("=" * 78)
+            log("FIRST STREAM UPDATE")
+            log("=" * 78)
+
+            log(
+                f"Raw timestamp : "
+                f"{format_timestamp(timestamp)}"
+            )
+
+            log(
+                f"Aligned bucket: "
+                f"{format_timestamp(aligned_start_timestamp)}"
+            )
+
+            log(
+                f"Raw second    : "
+                f"{timestamp % 60:02d}"
+            )
+
+            log(
+                f"Aligned second: "
+                f"{aligned_start_timestamp % 60:02d}"
+            )
+
+            log("")
+            log(
+                "The first received partial candle will NOT be "
+                "treated as a trading candle."
+            )
+
+            log("=" * 78)
+
+        # ----------------------------------------------------
+        # DETERMINE CORRECT WALL-CLOCK BUCKET
+        # ----------------------------------------------------
+
+        bucket_timestamp = aligned_bucket_timestamp(
+            timestamp,
+            TIMEFRAME_SECONDS
+        )
+
+        # ----------------------------------------------------
+        # INITIAL CANDLE
+        # ----------------------------------------------------
+
+        if current_candle is None:
+
+            current_candle = AlignedCandle(
+                bucket_timestamp,
+                close_price
+            )
+
+            log(
+                f"[ALIGN] Started candle "
+                f"{format_timestamp(bucket_timestamp)} → "
+                f"{format_timestamp(bucket_timestamp + TIMEFRAME_SECONDS)}"
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # SAME CANDLE
+        # ----------------------------------------------------
+
+        if bucket_timestamp == current_candle.timestamp:
+
+            current_candle.update(close_price)
+
+            # Show live update
+            print(
+                f"[LIVE] "
+                f"{format_timestamp(timestamp)} | "
+                f"{ASSET} | "
+                f"{close_price:.6f}",
+                flush=True
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # NEW CLOCK BUCKET
+        # ----------------------------------------------------
+
+        if bucket_timestamp > current_candle.timestamp:
+
+            # ------------------------------------------------
+            # CLOSE PREVIOUS CANDLE
+            # ------------------------------------------------
+
+            print_closed_candle(current_candle)
+
+            completed_candles += 1
+
+            # ------------------------------------------------
+            # Detect skipped intervals
+            # ------------------------------------------------
+
+            expected_next = (
+                current_candle.timestamp
+                + TIMEFRAME_SECONDS
+            )
+
+            if bucket_timestamp > expected_next:
+
+                missed = (
+                    bucket_timestamp - expected_next
+                ) // TIMEFRAME_SECONDS
+
+                log(
+                    f"WARNING: {missed} aligned candle "
+                    f"interval(s) had no stream update."
+                )
+
+            # ------------------------------------------------
+            # Start new aligned candle
+            # ------------------------------------------------
+
+            current_candle = AlignedCandle(
+                bucket_timestamp,
+                close_price
+            )
+
+            log(
+                f"[ALIGN] New candle "
+                f"{format_timestamp(bucket_timestamp)} → "
+                f"{format_timestamp(bucket_timestamp + TIMEFRAME_SECONDS)}"
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # OLD / OUT-OF-ORDER UPDATE
+        # ----------------------------------------------------
 
         log(
-            f"Calling subscribe_symbol_timed("
-            f"{ASSET}, timedelta(seconds={TIMEFRAME_SECONDS})"
-            f")"
+            f"[WARNING] Ignoring out-of-order update: "
+            f"{format_timestamp(timestamp)} "
+            f"(bucket {format_timestamp(bucket_timestamp)})"
         )
 
-        stream = await api.subscribe_symbol_timed(
-            ASSET,
-            timedelta(seconds=TIMEFRAME_SECONDS)
+    # ========================================================
+    # END
+    # ========================================================
+
+    log("")
+    log("=" * 78)
+    log("CANDLE ALIGNMENT TEST COMPLETE")
+    log("=" * 78)
+
+    log(f"Stream updates received : {received_updates}")
+    log(f"Completed candles        : {completed_candles}")
+
+    if current_candle is not None:
+
+        log(
+            f"Current forming candle  : "
+            f"{format_timestamp(current_candle.timestamp)} → "
+            f"{format_timestamp(current_candle.timestamp + TIMEFRAME_SECONDS)}"
         )
 
-        log("15-second stream subscription returned successfully.")
-        log("Waiting for candles...")
-
-        # --------------------------------------------------------
-        # STREAM
-        # --------------------------------------------------------
-
-        candle_count = 0
-
-        history = []
-
-        async for raw_candle in stream:
-
-            if shutdown_event.is_set():
-                break
-
-            log(
-                f"RAW STREAM DATA RECEIVED: "
-                f"{raw_candle!r}"
-            )
-
-            candle = normalize_candle(raw_candle)
-
-            if candle is None:
-
-                log(
-                    "WARNING: Could not normalize received "
-                    "stream item."
-                )
-
-                continue
-
-            candle_count += 1
-
-            history.append(candle)
-
-            if len(history) > LOOKBACK_WINDOW:
-                history.pop(0)
-
-            display_candle(
-                candle,
-                candle_count
-            )
-
-            log(
-                f"15s history: "
-                f"{len(history)}/{LOOKBACK_WINDOW}"
-            )
-
-            # ----------------------------------------------------
-            # STRATEGY WILL GO HERE
-            #
-            # We are intentionally NOT placing trades in this
-            # diagnostic version.
-            #
-            # Once we confirm that EURGBP_otc is continuously
-            # producing the correct 15-second candles, we put
-            # the rejection strategy back here.
-            # ----------------------------------------------------
-
-    except asyncio.CancelledError:
-
-        log("Stream task cancelled.")
-
-    except Exception as e:
-
-        print()
-        print("=" * 80)
-        print("STREAM ERROR")
-        print("=" * 80)
-
-        print(f"Error type : {type(e).__name__}")
-        print(f"Error      : {e}")
-
-        import traceback
-        traceback.print_exc()
-
-        print("=" * 80)
-
-    finally:
-
-        log("Shutting down PocketOption client...")
-
-        if api is not None:
-
-            try:
-
-                close_method = getattr(api, "close", None)
-
-                if close_method:
-
-                    result = close_method()
-
-                    if asyncio.iscoroutine(result):
-                        await result
-
-                    log("Client closed.")
-
-                else:
-
-                    log(
-                        "No async close() method exposed by client."
-                    )
-
-            except Exception as e:
-
-                log(
-                    f"Client shutdown warning: "
-                    f"{type(e).__name__}: {e}"
-                )
+    log("=" * 78)
 
 
 # ============================================================
-# ENTRY POINT
+# MAIN
 # ============================================================
 
 async def main():
 
-    try:
-        await run()
+    global shutdown_requested
 
-    except KeyboardInterrupt:
-        request_shutdown()
+    if not SSID:
+        raise RuntimeError(
+            "POCKET_OPTION_SSID environment variable is missing."
+        )
+
+    print()
+    print("=" * 78)
+    print("POCKET OPTION — 15 SECOND CLOCK ALIGNMENT TEST")
+    print("=" * 78)
+    print(f"Asset     : {ASSET}")
+    print(f"Timeframe : {TIMEFRAME_SECONDS}s")
+    print(f"Duration  : {TEST_DURATION_SECONDS}s")
+    print("=" * 78)
+    print()
+
+    client = None
+
+    try:
+
+        # ----------------------------------------------------
+        # Create client
+        # ----------------------------------------------------
+
+        log("Creating PocketOptionAsync client...")
+
+        client = PocketOptionAsync(
+            ssid=SSID
+        )
+
+        log("Client created.")
+
+        # ----------------------------------------------------
+        # Allow connection initialization
+        # ----------------------------------------------------
+
+        await asyncio.sleep(5)
+
+        # ----------------------------------------------------
+        # Run stream test
+        # ----------------------------------------------------
+
+        await run_test(client)
+
+    except asyncio.CancelledError:
+
+        log("Async task cancelled.")
+
+    except Exception as exc:
+
+        log("=" * 78)
+        log("TEST FAILED")
+        log("=" * 78)
+
+        log(
+            f"Error type : {type(exc).__name__}"
+        )
+
+        log(
+            f"Error      : {exc}"
+        )
+
+        import traceback
+
+        traceback.print_exc()
 
     finally:
-        log("BOT STOPPED")
 
+        if client is not None:
+
+            log("Shutting down PocketOption client...")
+
+            try:
+                await client.shutdown()
+            except Exception as exc:
+                log(
+                    f"Shutdown warning: {type(exc).__name__}: {exc}"
+                )
+
+            log("Client shutdown complete.")
+
+        print()
+        print("=" * 78)
+        print("TEST FINISHED")
+        print("=" * 78)
+
+
+# ============================================================
+# SIGNAL HANDLERS
+# ============================================================
 
 if __name__ == "__main__":
+
+    signal.signal(
+        signal.SIGINT,
+        request_shutdown
+    )
+
+    signal.signal(
+        signal.SIGTERM,
+        request_shutdown
+    )
+
     asyncio.run(main())
